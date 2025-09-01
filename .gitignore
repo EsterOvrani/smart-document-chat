@@ -60,3 +60,7 @@ Thumbs.db
 .env
 .env.local
 .env.production
+
+# Claude artifacts and temporary files
+claude/
+.claude/
