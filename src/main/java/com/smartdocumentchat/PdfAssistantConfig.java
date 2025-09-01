@@ -25,6 +25,7 @@ public class PdfAssistantConfig {
     @Value("${OPENAI_API_KEY}")
     private String openaiApiKey;
 
+
     @Bean
     public EmbeddingModel embeddingModel() {
         return new AllMiniLmL6V2EmbeddingModel();
@@ -46,7 +47,7 @@ public class PdfAssistantConfig {
     @Bean
     public EmbeddingStoreIngestor embeddingStoreIngestor() {
         return EmbeddingStoreIngestor.builder()
-                .documentSplitter(DocumentSplitters.recursive(300, 0))
+                .documentSplitter(DocumentSplitters.recursive(800, 100))
                 .embeddingModel(embeddingModel())
                 .embeddingStore(astraDbEmbeddingStore())
                 .build();
