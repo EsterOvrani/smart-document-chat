@@ -2,9 +2,9 @@ package com.smartdocumentchat;
 
 import dev.langchain4j.chain.ConversationalRetrievalChain;
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
-import dev.langchain4j.model.embedding.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.retriever.EmbeddingStoreRetriever;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
 import dev.langchain4j.store.embedding.cassandra.AstraDbEmbeddingConfiguration;
@@ -12,6 +12,7 @@ import dev.langchain4j.store.embedding.cassandra.AstraDbEmbeddingStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
 
 @Configuration
 public class PdfAssistantConfig {
@@ -26,9 +27,13 @@ public class PdfAssistantConfig {
     private String openaiApiKey;
 
 
+
     @Bean
     public EmbeddingModel embeddingModel() {
-        return new AllMiniLmL6V2EmbeddingModel();
+        return OpenAiEmbeddingModel.builder()
+                .apiKey(openaiApiKey)
+                .modelName("text-embedding-3-large")
+                .build();
     }
 
     @Bean
@@ -39,15 +44,15 @@ public class PdfAssistantConfig {
                 .databaseId(databaseId)
                 .databaseRegion("us-east1")
                 .keyspace("pdfassistant")
-                .table("pdfchat")
-                .dimension(384)
+                .table("pdfchat_openai")
+                .dimension(3072)
                 .build());
     }
 
     @Bean
     public EmbeddingStoreIngestor embeddingStoreIngestor() {
         return EmbeddingStoreIngestor.builder()
-                .documentSplitter(DocumentSplitters.recursive(800, 100))
+                .documentSplitter(DocumentSplitters.recursive(1200, 200))
                 .embeddingModel(embeddingModel())
                 .embeddingStore(astraDbEmbeddingStore())
                 .build();
