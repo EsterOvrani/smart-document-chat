@@ -7,16 +7,20 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.retriever.EmbeddingStoreRetriever;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
-import dev.langchain4j.store.embedding.qdrant.QdrantEmbeddingStore;
+import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
+import io.qdrant.client.QdrantClient;
+import io.qdrant.client.QdrantGrpcClient;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
 @RequiredArgsConstructor
 @Slf4j
+@EnableConfigurationProperties(QdrantProperties.class)
 public class QdrantConfig {
 
     private final QdrantProperties qdrantProperties;
@@ -34,17 +38,26 @@ public class QdrantConfig {
     }
 
     @Bean
-    public QdrantEmbeddingStore qdrantEmbeddingStore() {
-        log.info("Creating Qdrant embedding store - Host: {}, Port: {}, Collection: {}",
-                qdrantProperties.getHost(),
-                qdrantProperties.getPort(),
-                qdrantProperties.getCollectionName());
+    public QdrantClient qdrantClient() {
+        log.info("Creating Qdrant client - Host: {}, Port: {}",
+                qdrantProperties.getHost(), qdrantProperties.getPort());
 
-        return QdrantEmbeddingStore.builder()
-                .host(qdrantProperties.getHost())
-                .port(qdrantProperties.getPort())
-                .collectionName(qdrantProperties.getCollectionName())
-                .build();
+        return new QdrantClient(
+                QdrantGrpcClient.newBuilder(
+                        qdrantProperties.getHost(),
+                        qdrantProperties.getPort(),
+                        qdrantProperties.isUseTls()
+                ).build()
+        );
+    }
+
+    @Bean
+    public InMemoryEmbeddingStore embeddingStore() {
+        log.info("Creating embedding store (temporary in-memory until custom Qdrant implementation)");
+        log.info("Target Qdrant config - Collection: {}", qdrantProperties.getCollectionName());
+
+        // כרגע in-memory, אבל בשלב 4 נחליף בQdrant wrapper אמיתי
+        return new InMemoryEmbeddingStore();
     }
 
     @Bean
@@ -53,7 +66,7 @@ public class QdrantConfig {
         return EmbeddingStoreIngestor.builder()
                 .documentSplitter(DocumentSplitters.recursive(1200, 200))
                 .embeddingModel(embeddingModel())
-                .embeddingStore(qdrantEmbeddingStore())
+                .embeddingStore(embeddingStore())
                 .build();
     }
 
@@ -62,7 +75,7 @@ public class QdrantConfig {
         log.info("Creating conversational retrieval chain");
         return ConversationalRetrievalChain.builder()
                 .chatLanguageModel(OpenAiChatModel.withApiKey(openaiApiKey))
-                .retriever(EmbeddingStoreRetriever.from(qdrantEmbeddingStore(), embeddingModel()))
+                .retriever(EmbeddingStoreRetriever.from(embeddingStore(), embeddingModel()))
                 .build();
     }
 }

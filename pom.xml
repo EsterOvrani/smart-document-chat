@@ -42,9 +42,9 @@
 			<version>0.25.0</version>
 		</dependency>
 		<dependency>
-			<groupId>dev.langchain4j</groupId>
-			<artifactId>langchain4j-qdrant</artifactId>
-			<version>1.0.0-alpha1</version>
+			<groupId>io.qdrant</groupId>
+			<artifactId>client</artifactId>
+			<version>1.7.0</version>
 		</dependency>
 		<dependency>
 			<groupId>org.projectlombok</groupId>
