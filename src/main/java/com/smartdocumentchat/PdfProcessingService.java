@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.LocalDateTime;
@@ -148,17 +149,34 @@ public class PdfProcessingService {
      * יצירת מסמך מ-InputStream
      */
     private Document createDocumentFromInputStream(InputStream inputStream, String fileName, String fileId) throws IOException {
-        ApachePdfBoxDocumentParser parser = new ApachePdfBoxDocumentParser();
+        try {
+            ApachePdfBoxDocumentParser parser = new ApachePdfBoxDocumentParser();
 
-        byte[] fileBytes = inputStream.readAllBytes();
-        Document document = parser.parse(new java.io.ByteArrayInputStream(fileBytes));
+            // קריאה של כל הbytes
+            byte[] fileBytes = inputStream.readAllBytes();
 
-        // הוספת metadata למסמך
-        document.metadata().add("source", fileName);
-        document.metadata().add("file_id", fileId);
-        document.metadata().add("upload_time", LocalDateTime.now().toString());
+            // יצירת InputStream חדש מהbytes
+            try (ByteArrayInputStream byteStream = new ByteArrayInputStream(fileBytes)) {
+                // בגרסה 0.34.0, השיטה parse מקבלת InputStream ישירות
+                Document document = parser.parse(byteStream);
 
-        return document;
+                // בדיקה שהמסמך לא ריק
+                if (document.text() == null || document.text().trim().isEmpty()) {
+                    throw new IOException("הקובץ נפרסר אבל לא מכיל טקסט");
+                }
+
+                // הוספת metadata למסמך
+                document.metadata().add("source", fileName);
+                document.metadata().add("file_id", fileId);
+                document.metadata().add("upload_time", LocalDateTime.now().toString());
+
+                log.info("מסמך פורסר בהצלחה: {} עם {} תווים", fileName, document.text().length());
+                return document;
+            }
+        } catch (Exception e) {
+            log.error("שגיאה בפרסור קובץ PDF: {}", fileName, e);
+            throw new IOException("לא ניתן לפרסר את קובץ ה-PDF: " + e.getMessage(), e);
+        }
     }
 
     /**

@@ -1,4 +1,4 @@
-package com.programming.techie.pdfassistant;
+package com.smartdocumentchat;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;

@@ -2,14 +2,14 @@ package com.smartdocumentchat;
 
 import dev.langchain4j.chain.ConversationalRetrievalChain;
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.retriever.EmbeddingStoreRetriever;
+import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
-import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
-import io.qdrant.client.QdrantClient;
-import io.qdrant.client.QdrantGrpcClient;
+import dev.langchain4j.store.embedding.qdrant.QdrantEmbeddingStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -38,26 +38,17 @@ public class QdrantConfig {
     }
 
     @Bean
-    public QdrantClient qdrantClient() {
-        log.info("Creating Qdrant client - Host: {}, Port: {}",
-                qdrantProperties.getHost(), qdrantProperties.getPort());
+    public EmbeddingStore<TextSegment> embeddingStore() {
+        log.info("Creating Qdrant embedding store - Host: {}, Port: {}, Collection: {}",
+                qdrantProperties.getHost(),
+                qdrantProperties.getPort(),
+                qdrantProperties.getCollectionName());
 
-        return new QdrantClient(
-                QdrantGrpcClient.newBuilder(
-                        qdrantProperties.getHost(),
-                        qdrantProperties.getPort(),
-                        qdrantProperties.isUseTls()
-                ).build()
-        );
-    }
-
-    @Bean
-    public InMemoryEmbeddingStore embeddingStore() {
-        log.info("Creating embedding store (temporary in-memory until custom Qdrant implementation)");
-        log.info("Target Qdrant config - Collection: {}", qdrantProperties.getCollectionName());
-
-        // כרגע in-memory, אבל בשלב 4 נחליף בQdrant wrapper אמיתי
-        return new InMemoryEmbeddingStore();
+        return QdrantEmbeddingStore.builder()
+                .host(qdrantProperties.getHost())
+                .port(qdrantProperties.getPort())
+                .collectionName(qdrantProperties.getCollectionName())
+                .build();
     }
 
     @Bean

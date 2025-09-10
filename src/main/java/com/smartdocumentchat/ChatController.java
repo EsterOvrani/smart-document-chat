@@ -1,6 +1,5 @@
 package com.smartdocumentchat;
 
-
 import dev.langchain4j.chain.ConversationalRetrievalChain;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -20,6 +19,7 @@ public class ChatController {
 
     private final ConversationalRetrievalChain conversationalRetrievalChain;
     private final PdfProcessingService pdfProcessingService;
+    private final QdrantVectorService qdrantVectorService;
 
     /**
      * העלאה ועיבוד קובץ PDF חדש
@@ -202,18 +202,31 @@ public class ChatController {
      */
     @GetMapping("/status")
     public ResponseEntity<?> getSystemStatus() {
-        return ResponseEntity.ok(Map.of(
-                "success", true,
-                "systemStatus", "active",
-                "hasActiveFile", pdfProcessingService.getCurrentActiveFileId() != null,
-                "activeFileName", pdfProcessingService.getCurrentActiveFileName(),
-                "uploadTime", pdfProcessingService.getCurrentUploadTime(),
-                "chunkingSettings", Map.of(
-                        "chunkSize", 800,
-                        "chunkOverlap", 100,
-                        "maxResults", 5
-                )
-        ));
+        try {
+            Map<String, Object> response = Map.of(
+                    "success", true,
+                    "systemStatus", "active",
+                    "hasActiveFile", pdfProcessingService.getCurrentActiveFileId() != null,
+                    "activeFileName", pdfProcessingService.getCurrentActiveFileName() != null ?
+                            pdfProcessingService.getCurrentActiveFileName() : "אין קובץ",
+                    "uploadTime", pdfProcessingService.getCurrentUploadTime() != null ?
+                            pdfProcessingService.getCurrentUploadTime() : "לא הועלה קובץ",
+                    "qdrantCollection", qdrantVectorService.getCurrentCollectionName(),
+                    "chunkingSettings", Map.of(
+                            "chunkSize", 1200,
+                            "chunkOverlap", 200,
+                            "maxResults", 5
+                    )
+            );
+            return ResponseEntity.ok(response);
+
+        } catch (Exception e) {
+            log.error("שגיאה בקבלת סטטוס המערכת", e);
+            return ResponseEntity.ok(Map.of(
+                    "success", false,
+                    "error", "שגיאה בקבלת סטטוס המערכת: " + e.getMessage()
+            ));
+        }
     }
 
     /**
