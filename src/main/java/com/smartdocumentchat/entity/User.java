@@ -8,6 +8,8 @@ import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 
 @Entity
 @Table(name = "users")
@@ -46,7 +48,11 @@ public class User {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
-    // Helper method
+    // Relationship to ChatSessions (One-to-Many)
+    @OneToMany(mappedBy = "user", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<ChatSession> chatSessions = new ArrayList<>();
+
+    // Helper methods
     public String getFullName() {
         if (firstName == null && lastName == null) {
             return username;
@@ -58,5 +64,19 @@ public class User {
             return firstName;
         }
         return firstName + " " + lastName;
+    }
+
+    public void addChatSession(ChatSession session) {
+        chatSessions.add(session);
+        session.setUser(this);
+    }
+
+    public void removeChatSession(ChatSession session) {
+        chatSessions.remove(session);
+        session.setUser(null);
+    }
+
+    public int getChatSessionCount() {
+        return chatSessions.size();
     }
 }
