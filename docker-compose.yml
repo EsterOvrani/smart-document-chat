@@ -14,6 +14,27 @@ services:
       - QDRANT__SERVICE__GRPC_PORT=6334
     restart: unless-stopped
 
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-smart-doc-chat
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=smartdocumentchat
+      - POSTGRES_USER=smartdoc_user
+      - POSTGRES_PASSWORD=smartdoc_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartdoc_user -d smartdocumentchat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 volumes:
   qdrant_storage:
+    driver: local
+  postgres_data:
     driver: local
