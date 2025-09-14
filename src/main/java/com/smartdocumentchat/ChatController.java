@@ -397,6 +397,44 @@ public class ChatController {
         log.debug("Invalidating cache for session: {}", sessionId);
     }
 
+    @PostMapping("/session/{sessionId}/activate")
+    public ResponseEntity<?> activateSession(@PathVariable Long sessionId) {
+        try {
+            User demoUser = userService.getOrCreateDemoUser();
+
+            if (!chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            // הגדר כשיחה פעילה
+            chatSessionService.setActiveSession(demoUser, sessionOpt.get());
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "שיחה הוגדרה כפעילה",
+                    "activeSessionId", sessionId
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בהפעלת שיחה", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בהפעלת השיחה"
+            ));
+        }
+    }
+
     /**
      * מחלקה פנימית לבקשת צ'אט
      */
