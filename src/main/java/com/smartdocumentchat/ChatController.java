@@ -1,5 +1,10 @@
 package com.smartdocumentchat;
 
+import com.smartdocumentchat.entity.ChatSession;
+import com.smartdocumentchat.entity.Document;
+import com.smartdocumentchat.entity.User;
+import com.smartdocumentchat.service.ChatSessionService;
+import com.smartdocumentchat.service.UserService;
 import dev.langchain4j.chain.ConversationalRetrievalChain;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -9,7 +14,9 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api")
@@ -20,21 +27,49 @@ public class ChatController {
     private final ConversationalRetrievalChain conversationalRetrievalChain;
     private final PdfProcessingService pdfProcessingService;
     private final QdrantVectorService qdrantVectorService;
+    private final UserService userService;
+    private final ChatSessionService chatSessionService;
 
     /**
-     * העלאה ועיבוד קובץ PDF חדש
+     * העלאה ועיבוד קובץ PDF חדש לשיחה
      */
     @PostMapping("/upload-pdf")
-    public ResponseEntity<?> uploadPdf(@RequestParam("file") MultipartFile file) {
+    public ResponseEntity<?> uploadPdf(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(value = "sessionId", required = false) Long sessionId) {
         try {
-            String fileId = pdfProcessingService.processPdfFile(file);
+            // קבלת או יצירת משתמש דמה (זמני עד שלב 9)
+            User demoUser = userService.getOrCreateDemoUser();
+
+            // קבלת או יצירת שיחה
+            ChatSession chatSession;
+            if (sessionId != null) {
+                Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+                if (sessionOpt.isEmpty() || !chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+                    return ResponseEntity.badRequest().body(Map.of(
+                            "success", false,
+                            "error", "שיחה לא נמצאה או שאין הרשאה"
+                    ));
+                }
+                chatSession = sessionOpt.get();
+            } else {
+                // צור שיחה חדשה
+                String sessionTitle = "שיחה עם " + file.getOriginalFilename();
+                chatSession = chatSessionService.createSession(demoUser, sessionTitle, "שיחה לעיבוד מסמך");
+            }
+
+            // עיבוד הקובץ
+            Document document = pdfProcessingService.processPdfFile(file, chatSession);
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "message", "הקובץ הועלה ועובד בהצלחה",
-                    "fileId", fileId,
-                    "fileName", file.getOriginalFilename(),
-                    "uploadTime", pdfProcessingService.getCurrentUploadTime()
+                    "documentId", document.getId(),
+                    "sessionId", chatSession.getId(),
+                    "fileName", document.getOriginalFileName(),
+                    "uploadTime", document.getCreatedAt().format(
+                            java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
+                    )
             ));
 
         } catch (IllegalArgumentException e) {
@@ -48,7 +83,7 @@ public class ChatController {
             log.error("שגיאה בעיבוד הקובץ", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
                     "success", false,
-                    "error", "שגיאה בעיבוד הקובץ"
+                    "error", "שגיאה בעיבוד הקובץ: " + e.getMessage()
             ));
 
         } catch (Exception e) {
@@ -61,10 +96,12 @@ public class ChatController {
     }
 
     /**
-     * שאילת שאלה על הקובץ הנוכחי - עם עיבוד חכם של השאלה
+     * שאילת שאלה על מסמכי השיחה
      */
     @PostMapping("/chat")
-    public ResponseEntity<?> chatWithPdf(@RequestBody ChatRequest request) {
+    public ResponseEntity<?> chatWithDocuments(
+            @RequestBody ChatRequest request,
+            @RequestParam(value = "sessionId", required = false) Long sessionId) {
         try {
             if (request.getText() == null || request.getText().trim().isEmpty()) {
                 return ResponseEntity.badRequest().body(Map.of(
@@ -73,28 +110,58 @@ public class ChatController {
                 ));
             }
 
-            String activeFileId = pdfProcessingService.getCurrentActiveFileId();
-            if (activeFileId == null) {
+            // קבלת משתמש דמה
+            User demoUser = userService.getOrCreateDemoUser();
+
+            // קבלת שיחה
+            ChatSession chatSession;
+            if (sessionId != null) {
+                Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+                if (sessionOpt.isEmpty() || !chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+                    return ResponseEntity.badRequest().body(Map.of(
+                            "success", false,
+                            "error", "שיחה לא נמצאה או שאין הרשאה"
+                    ));
+                }
+                chatSession = sessionOpt.get();
+            } else {
+                // נסה לקבל את השיחה האחרונה
+                Optional<ChatSession> lastSession = chatSessionService.getLastSession(demoUser);
+                if (lastSession.isEmpty()) {
+                    return ResponseEntity.badRequest().body(Map.of(
+                            "success", false,
+                            "error", "לא נמצאה שיחה פעילה. אנא העלה קובץ PDF תחילה"
+                    ));
+                }
+                chatSession = lastSession.get();
+            }
+
+            // בדיקה שיש מסמכים בשיחה
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(chatSession);
+            if (documents.isEmpty()) {
                 return ResponseEntity.badRequest().body(Map.of(
                         "success", false,
-                        "error", "לא הועלה קובץ עדיין. אנא העלה קובץ PDF תחילה"
+                        "error", "לא נמצאו מסמכים בשיחה. אנא העלה קובץ PDF תחילה"
                 ));
             }
 
-            // עיבוד השאלה לשיפור הדיוק
-            String enhancedQuestion = enhanceQuestion(request.getText(), pdfProcessingService.getCurrentActiveFileName());
-
-            // שימוש ב-ConversationalRetrievalChain עם השאלה המשופרת
+            // עיבוד השאלה
+            String enhancedQuestion = enhanceQuestion(request.getText(), documents);
             String answer = conversationalRetrievalChain.execute(enhancedQuestion);
-            log.debug("Enhanced question: {} | Answer for file {} - {}", enhancedQuestion, activeFileId, answer);
+
+            // עדכון זמן פעילות השיחה
+            chatSessionService.updateLastActivity(chatSession.getId());
+
+            log.debug("Enhanced question: {} | Answer for session {} - {}",
+                    enhancedQuestion, chatSession.getId(), answer);
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "answer", answer,
                     "originalQuestion", request.getText(),
                     "enhancedQuestion", enhancedQuestion,
-                    "activeFileId", activeFileId,
-                    "activeFileName", pdfProcessingService.getCurrentActiveFileName()
+                    "sessionId", chatSession.getId(),
+                    "documentsCount", documents.size()
             ));
 
         } catch (Exception e) {
@@ -107,118 +174,114 @@ public class ChatController {
     }
 
     /**
-     * שיפור השאלה לדיוק טוב יותר
+     * קבלת מידע על שיחה ספציפית
      */
-    private String enhanceQuestion(String originalQuestion, String fileName) {
-        // הוספת הקשר למסמך הספציפי
-        String enhancedQuestion = String.format(
-                "בהתבסס על המסמך '%s' שהועלה למערכת, ענה על השאלה הבאה: %s\n\n" +
-                        "חשוב: ענה רק על בסיס המידע שמופיע במסמך הזה בלבד.",
-                fileName, originalQuestion
-        );
-
-        // שיפורים ספציפיים לסוגי שאלות נפוצות
-        String lowerQuestion = originalQuestion.toLowerCase();
-
-        if (lowerQuestion.contains("שם") || lowerQuestion.contains("name")) {
-            enhancedQuestion += "\n\nחפש שמות של אנשים, חברות, פרויקטים או טכנולוגיות המוזכרים במסמך.";
-        } else if (lowerQuestion.contains("שפ") || lowerQuestion.contains("language")) {
-            enhancedQuestion += "\n\nחפש מידע על שפות תכנות, שפות דיבור או כל שפה אחרת המוזכרת במסמך.";
-        } else if (lowerQuestion.contains("פרויקט") || lowerQuestion.contains("project")) {
-            enhancedQuestion += "\n\nחפש מידע על פרויקטים, עבודות או התפתחות מקצועית המוזכרת במסמך.";
-        } else if (lowerQuestion.contains("טכנולוגי") || lowerQuestion.contains("technolog")) {
-            enhancedQuestion += "\n\nחפש מידע על טכנולוגיות, כלים או מיומנויות טכניות המוזכרות במסמך.";
-        } else if (lowerQuestion.contains("ניסיון") || lowerQuestion.contains("experience")) {
-            enhancedQuestion += "\n\nחפש מידע על ניסיון מקצועי, עבודות קודמות או הישגים המוזכרים במסמך.";
-        }
-
-        return enhancedQuestion;
-    }
-
-    /**
-     * קבלת מידע על הקובץ הנוכחי
-     */
-    @GetMapping("/current-file")
-    public ResponseEntity<?> getCurrentFile() {
-        String activeFileId = pdfProcessingService.getCurrentActiveFileId();
-        if (activeFileId == null) {
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "currentFile", null,
-                    "message", "אין קובץ במערכת כרגע"
-            ));
-        }
-
-        return ResponseEntity.ok(Map.of(
-                "success", true,
-                "fileInfo", pdfProcessingService.getCurrentFileInfo()
-        ));
-    }
-
-    /**
-     * קבלת רשימת הקבצים
-     */
-    @GetMapping("/files")
-    public ResponseEntity<?> getUploadedFiles() {
-        Map<String, String> files = pdfProcessingService.getUploadedFiles();
-
-        return ResponseEntity.ok(Map.of(
-                "success", true,
-                "files", files,
-                "totalFiles", files.size(),
-                "currentFileInfo", pdfProcessingService.getCurrentFileInfo()
-        ));
-    }
-
-    /**
-     * מחיקת הקובץ הנוכחי
-     */
-    @DeleteMapping("/current-file")
-    public ResponseEntity<?> deleteCurrentFile() {
+    @GetMapping("/session/{sessionId}")
+    public ResponseEntity<?> getSessionInfo(@PathVariable Long sessionId) {
         try {
-            boolean deleted = pdfProcessingService.deleteCurrentFile();
-            if (deleted) {
-                return ResponseEntity.ok(Map.of(
-                        "success", true,
-                        "message", "הקובץ הנוכחי נמחק בהצלחה"
-                ));
-            } else {
+            User demoUser = userService.getOrCreateDemoUser();
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty() || !chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
                 return ResponseEntity.badRequest().body(Map.of(
                         "success", false,
-                        "error", "אין קובץ למחיקה"
+                        "error", "שיחה לא נמצאה"
                 ));
             }
+
+            ChatSession session = sessionOpt.get();
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "session", Map.of(
+                            "id", session.getId(),
+                            "title", session.getDisplayTitle(),
+                            "description", session.getDescription(),
+                            "createdAt", session.getCreatedAt().format(
+                                    java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
+                            ),
+                            "documentsCount", documents.size(),
+                            "documents", documents.stream().map(doc -> Map.of(
+                                    "id", doc.getId(),
+                                    "fileName", doc.getOriginalFileName(),
+                                    "status", doc.getProcessingStatus(),
+                                    "uploadTime", doc.getCreatedAt().format(
+                                            java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
+                                    )
+                            )).toList()
+                    )
+            ));
         } catch (Exception e) {
-            log.error("שגיאה במחיקת קובץ", e);
+            log.error("שגיאה בקבלת מידע שיחה", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
                     "success", false,
-                    "error", "שגיאה במחיקת הקובץ"
+                    "error", "שגיאה בקבלת מידע השיחה"
             ));
         }
     }
 
     /**
-     * בדיקת סטטוס המערכת עם פרטים על הביצועים
+     * קבלת רשימת שיחות המשתמש
+     */
+    @GetMapping("/sessions")
+    public ResponseEntity<?> getUserSessions() {
+        try {
+            User demoUser = userService.getOrCreateDemoUser();
+            List<ChatSession> sessions = chatSessionService.getUserSessions(demoUser);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "sessions", sessions.stream().map(session -> Map.of(
+                            "id", session.getId(),
+                            "title", session.getDisplayTitle(),
+                            "description", session.getDescription(),
+                            "createdAt", session.getCreatedAt().format(
+                                    java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
+                            ),
+                            "documentsCount", session.getDocumentCount(),
+                            "messagesCount", session.getMessageCount()
+                    )).toList(),
+                    "totalSessions", sessions.size()
+            ));
+        } catch (Exception e) {
+            log.error("שגיאה בקבלת שיחות", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בקבלת רשימת השיחות"
+            ));
+        }
+    }
+
+    /**
+     * בדיקת סטטוס המערכת
      */
     @GetMapping("/status")
     public ResponseEntity<?> getSystemStatus() {
         try {
-            Map<String, Object> response = Map.of(
+            User demoUser = userService.getOrCreateDemoUser();
+            long userSessions = chatSessionService.countUserSessions(demoUser);
+            PdfProcessingService.DocumentStats stats = pdfProcessingService.getUserDocumentStats(demoUser);
+
+            return ResponseEntity.ok(Map.of(
                     "success", true,
                     "systemStatus", "active",
-                    "hasActiveFile", pdfProcessingService.getCurrentActiveFileId() != null,
-                    "activeFileName", pdfProcessingService.getCurrentActiveFileName() != null ?
-                            pdfProcessingService.getCurrentActiveFileName() : "אין קובץ",
-                    "uploadTime", pdfProcessingService.getCurrentUploadTime() != null ?
-                            pdfProcessingService.getCurrentUploadTime() : "לא הועלה קובץ",
+                    "user", Map.of(
+                            "username", demoUser.getUsername(),
+                            "sessionsCount", userSessions
+                    ),
+                    "documents", Map.of(
+                            "total", stats.totalDocuments,
+                            "processing", stats.processingDocuments,
+                            "failed", stats.failedDocuments
+                    ),
                     "qdrantCollection", qdrantVectorService.getCurrentCollectionName(),
                     "chunkingSettings", Map.of(
                             "chunkSize", 1200,
                             "chunkOverlap", 200,
                             "maxResults", 5
                     )
-            );
-            return ResponseEntity.ok(response);
+            ));
 
         } catch (Exception e) {
             log.error("שגיאה בקבלת סטטוס המערכת", e);
@@ -227,6 +290,32 @@ public class ChatController {
                     "error", "שגיאה בקבלת סטטוס המערכת: " + e.getMessage()
             ));
         }
+    }
+
+    /**
+     * שיפור השאלה לדיוק טוב יותר
+     */
+    private String enhanceQuestion(String originalQuestion, List<Document> documents) {
+        StringBuilder documentsList = new StringBuilder();
+        for (Document doc : documents) {
+            documentsList.append("- ").append(doc.getOriginalFileName()).append("\n");
+        }
+
+        String enhancedQuestion = String.format(
+                "בהתבסס על המסמכים הבאים שהועלו למערכת:\n%s\nענה על השאלה: %s\n\n" +
+                        "חשוב: ענה רק על בסיס המידע שמופיע במסמכים האלה בלבד.",
+                documentsList.toString(), originalQuestion
+        );
+
+        // שיפורים ספציפיים לסוגי שאלות נפוצות
+        String lowerQuestion = originalQuestion.toLowerCase();
+        if (lowerQuestion.contains("שם") || lowerQuestion.contains("name")) {
+            enhancedQuestion += "\n\nחפש שמות של אנשים, חברות, פרויקטים או טכנולוגיות המוזכרים במסמכים.";
+        } else if (lowerQuestion.contains("פרויקט") || lowerQuestion.contains("project")) {
+            enhancedQuestion += "\n\nחפש מידע על פרויקטים, עבודות או התפתחות מקצועית המוזכרת במסמכים.";
+        }
+
+        return enhancedQuestion;
     }
 
     /**
