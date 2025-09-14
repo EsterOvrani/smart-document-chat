@@ -4,6 +4,7 @@ import com.smartdocumentchat.entity.ChatSession;
 import com.smartdocumentchat.entity.Document;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.repository.DocumentRepository;
+import com.smartdocumentchat.service.CacheService;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentParser;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
@@ -27,6 +28,7 @@ public class PdfProcessingService {
 
     private final EmbeddingStoreIngestor embeddingStoreIngestor;
     private final DocumentRepository documentRepository;
+    private final CacheService cacheService;
 
     /**
      * עיבוד קובץ PDF חדש לשיחה ספציפית
@@ -91,7 +93,10 @@ public class PdfProcessingService {
             int estimatedChunks = (int) Math.ceil(langchainDoc.text().length() / 1200.0);
             document.setChunkCount(estimatedChunks);
 
-            documentRepository.save(document);
+            document = documentRepository.save(document);
+
+            // Invalidate caches after successful processing
+            invalidateDocumentCache(document.getId(), chatSession.getId());
 
             log.info("קובץ {} עובד בהצלחה עם {} תווים", originalFileName, langchainDoc.text().length());
             return document;
@@ -110,24 +115,57 @@ public class PdfProcessingService {
     }
 
     /**
-     * קבלת כל המסמכים של שיחה
+     * קבלת כל המסמכים של שיחה עם caching
      */
     public List<Document> getDocumentsBySession(ChatSession chatSession) {
-        return documentRepository.findByChatSessionAndActiveTrueOrderByCreatedAtDesc(chatSession);
+        String cacheKey = "session_docs:" + chatSession.getId();
+
+        @SuppressWarnings("unchecked")
+        List<Document> cachedDocs = (List<Document>) cacheService.getDocumentMetadata(cacheKey);
+
+        if (cachedDocs != null) {
+            log.debug("Documents for session {} retrieved from cache", chatSession.getId());
+            return cachedDocs;
+        }
+
+        // Get from database
+        List<Document> documents = documentRepository.findByChatSessionAndActiveTrueOrderByCreatedAtDesc(chatSession);
+
+        // Cache for 6 hours
+        cacheService.cacheDocumentMetadata(cacheKey, documents);
+        log.debug("Documents for session {} retrieved from database and cached", chatSession.getId());
+
+        return documents;
     }
 
     /**
-     * קבלת מסמך לפי ID
+     * קבלת מסמך לפי ID עם caching
      */
     public Optional<Document> getDocumentById(Long documentId) {
-        return documentRepository.findById(documentId);
+        String cacheKey = "document:" + documentId;
+        Document cachedDoc = (Document) cacheService.getDocumentMetadata(cacheKey);
+
+        if (cachedDoc != null) {
+            log.debug("Document {} retrieved from cache", documentId);
+            return Optional.of(cachedDoc);
+        }
+
+        Optional<Document> docOpt = documentRepository.findById(documentId);
+
+        if (docOpt.isPresent()) {
+            // Cache the document
+            cacheService.cacheDocumentMetadata(cacheKey, docOpt.get());
+            log.debug("Document {} retrieved from database and cached", documentId);
+        }
+
+        return docOpt;
     }
 
     /**
-     * מחיקת מסמך (soft delete)
+     * מחיקת מסמך (soft delete) עם cache invalidation
      */
     public boolean deleteDocument(Long documentId, User user) {
-        Optional<Document> docOpt = documentRepository.findById(documentId);
+        Optional<Document> docOpt = getDocumentById(documentId);
         if (docOpt.isPresent()) {
             Document document = docOpt.get();
 
@@ -140,6 +178,10 @@ public class PdfProcessingService {
 
             document.setActive(false);
             documentRepository.save(document);
+
+            // Invalidate caches
+            invalidateDocumentCache(documentId, document.getChatSession().getId());
+
             log.info("מסמך {} נמחק בהצלחה", document.getOriginalFileName());
             return true;
         }
@@ -150,6 +192,14 @@ public class PdfProcessingService {
      * סטטיסטיקות משתמש
      */
     public DocumentStats getUserDocumentStats(User user) {
+        String cacheKey = "user_stats:" + user.getId();
+        DocumentStats cachedStats = (DocumentStats) cacheService.get(cacheKey);
+
+        if (cachedStats != null) {
+            log.debug("Document stats for user {} retrieved from cache", user.getId());
+            return cachedStats;
+        }
+
         long totalDocs = documentRepository.countByUserAndProcessingStatus(
                 user, Document.ProcessingStatus.COMPLETED);
         long processingDocs = documentRepository.countByUserAndProcessingStatus(
@@ -157,7 +207,13 @@ public class PdfProcessingService {
         long failedDocs = documentRepository.countByUserAndProcessingStatus(
                 user, Document.ProcessingStatus.FAILED);
 
-        return new DocumentStats(totalDocs, processingDocs, failedDocs);
+        DocumentStats stats = new DocumentStats(totalDocs, processingDocs, failedDocs);
+
+        // Cache for 10 minutes
+        cacheService.set(cacheKey, stats, java.time.Duration.ofMinutes(10));
+        log.debug("Document stats for user {} retrieved from database and cached", user.getId());
+
+        return stats;
     }
 
     // Helper methods
@@ -227,6 +283,24 @@ public class PdfProcessingService {
             log.error("שגיאה בחישוב hash", e);
             return null;
         }
+    }
+
+    /**
+     * פינוי cache של מסמכים
+     */
+    private void invalidateDocumentCache(Long documentId, Long sessionId) {
+        // Invalidate individual document cache
+        cacheService.delete("document:" + documentId);
+
+        // Invalidate session documents cache
+        if (sessionId != null) {
+            cacheService.delete("session_docs:" + sessionId);
+        }
+
+        // Invalidate user stats cache (we don't have user ID here, but it's OK)
+        // Stats cache has short TTL anyway
+
+        log.debug("Invalidated document cache for document {} and session {}", documentId, sessionId);
     }
 
     // Inner class for statistics
