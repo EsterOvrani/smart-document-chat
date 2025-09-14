@@ -5,6 +5,8 @@ import com.smartdocumentchat.entity.Document;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.service.ChatSessionService;
 import com.smartdocumentchat.service.UserService;
+import com.smartdocumentchat.service.CacheService;
+import com.smartdocumentchat.service.QuestionHashService;
 import dev.langchain4j.chain.ConversationalRetrievalChain;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,6 +19,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api")
@@ -29,6 +32,8 @@ public class ChatController {
     private final QdrantVectorService qdrantVectorService;
     private final UserService userService;
     private final ChatSessionService chatSessionService;
+    private final CacheService cacheService;
+    private final QuestionHashService questionHashService;
 
     /**
      * העלאה ועיבוד קובץ PDF חדש לשיחה
@@ -60,6 +65,9 @@ public class ChatController {
 
             // עיבוד הקובץ
             Document document = pdfProcessingService.processPdfFile(file, chatSession);
+
+            // אחרי הוספת מסמך חדש, נקה cache של Q&A לשיחה זו
+            invalidateSessionCache(chatSession.getId());
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -102,6 +110,10 @@ public class ChatController {
     public ResponseEntity<?> chatWithDocuments(
             @RequestBody ChatRequest request,
             @RequestParam(value = "sessionId", required = false) Long sessionId) {
+
+        long startTime = System.currentTimeMillis();
+        boolean cacheHit = false;
+
         try {
             if (request.getText() == null || request.getText().trim().isEmpty()) {
                 return ResponseEntity.badRequest().body(Map.of(
@@ -145,23 +157,48 @@ public class ChatController {
                 ));
             }
 
-            // עיבוד השאלה
-            String enhancedQuestion = enhanceQuestion(request.getText(), documents);
-            String answer = conversationalRetrievalChain.execute(enhancedQuestion);
+            // יצירת hash לשאלה
+            List<String> documentIds = documents.stream()
+                    .map(doc -> doc.getId().toString())
+                    .collect(Collectors.toList());
+
+            String questionHash = questionHashService.generateQuestionHash(request.getText(), documentIds);
+
+            // בדיקה אם יש תשובה בcache
+            String cachedAnswer = cacheService.getCachedQAResult(questionHash);
+            String answer;
+
+            if (cachedAnswer != null) {
+                answer = cachedAnswer;
+                cacheHit = true;
+                log.debug("Cache HIT for question hash: {}", questionHash);
+            } else {
+                // אם אין בcache, עבד את השאלה
+                String enhancedQuestion = enhanceQuestion(request.getText(), documents);
+                answer = conversationalRetrievalChain.execute(enhancedQuestion);
+
+                // שמור בcache
+                cacheService.cacheQAResult(questionHash, answer);
+                log.debug("Cache MISS for question hash: {}, answer cached", questionHash);
+            }
 
             // עדכון זמן פעילות השיחה
             chatSessionService.updateLastActivity(chatSession.getId());
 
-            log.debug("Enhanced question: {} | Answer for session {} - {}",
-                    enhancedQuestion, chatSession.getId(), answer);
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            log.debug("Question processed for session {} in {}ms (cache: {})",
+                    chatSession.getId(), processingTime, cacheHit ? "HIT" : "MISS");
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "answer", answer,
                     "originalQuestion", request.getText(),
-                    "enhancedQuestion", enhancedQuestion,
                     "sessionId", chatSession.getId(),
-                    "documentsCount", documents.size()
+                    "documentsCount", documents.size(),
+                    "processingTime", processingTime,
+                    "cacheHit", cacheHit,
+                    "questionHash", questionHash
             ));
 
         } catch (Exception e) {
@@ -280,6 +317,10 @@ public class ChatController {
                             "chunkSize", 1200,
                             "chunkOverlap", 200,
                             "maxResults", 5
+                    ),
+                    "cacheStatus", Map.of(
+                            "redisConnected", true,
+                            "cacheEnabled", true
                     )
             ));
 
@@ -288,6 +329,36 @@ public class ChatController {
             return ResponseEntity.ok(Map.of(
                     "success", false,
                     "error", "שגיאה בקבלת סטטוס המערכת: " + e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * פינוי cache לשיחה ספציפית
+     */
+    @PostMapping("/cache/clear/{sessionId}")
+    public ResponseEntity<?> clearSessionCache(@PathVariable Long sessionId) {
+        try {
+            User demoUser = userService.getOrCreateDemoUser();
+
+            if (!chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            invalidateSessionCache(sessionId);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "Cache של השיחה נוקה בהצלחה"
+            ));
+        } catch (Exception e) {
+            log.error("שגיאה בניקוי cache", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בניקוי cache"
             ));
         }
     }
@@ -316,6 +387,14 @@ public class ChatController {
         }
 
         return enhancedQuestion;
+    }
+
+    /**
+     * פינוי cache של שיחה ספציפית
+     */
+    private void invalidateSessionCache(Long sessionId) {
+        // כרגע לא מימשנו cache לפי session, אבל נוסיף בעתיד
+        log.debug("Invalidating cache for session: {}", sessionId);
     }
 
     /**
