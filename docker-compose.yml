@@ -33,8 +33,27 @@ services:
       timeout: 10s
       retries: 3
 
+  redis:
+    image: redis:7-alpine
+    container_name: redis-smart-doc-chat
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    environment:
+      - REDIS_PASSWORD=smartdoc_redis_pass
+    command: redis-server --appendonly yes --requirepass smartdoc_redis_pass
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "smartdoc_redis_pass", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 volumes:
   qdrant_storage:
     driver: local
   postgres_data:
+    driver: local
+  redis_data:
     driver: local
