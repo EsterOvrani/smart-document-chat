@@ -31,45 +31,53 @@ public class PdfProcessingService {
     private final CacheService cacheService;
 
     /**
-     * עיבוד קובץ PDF חדש לשיחה ספציפית
+     * עיבוד קובץ PDF חדש לשיחה ספציפית עם קישור משתמש מפורש
      */
     public Document processPdfFile(MultipartFile file, ChatSession chatSession) throws IOException {
         validateFile(file);
+        validateChatSessionForUpload(chatSession);
 
         String originalFileName = file.getOriginalFilename();
-        log.info("מתחיל עיבוד קובץ PDF: {} עבור שיחה: {}", originalFileName, chatSession.getId());
+        User sessionUser = chatSession.getUser();
+
+        log.info("מתחיל עיבוד קובץ PDF: {} עבור שיחה: {} של משתמש: {}",
+                originalFileName, chatSession.getId(), sessionUser.getUsername());
 
         // בדיקה אם קובץ עם אותו שם כבר קיים בשיחה
         Optional<Document> existingDoc = documentRepository
                 .findByChatSessionAndFileName(chatSession, originalFileName);
 
         if (existingDoc.isPresent()) {
-            log.warn("קובץ עם שם {} כבר קיים בשיחה {}", originalFileName, chatSession.getId());
+            log.warn("קובץ עם שם {} כבר קיים בשיחה {} של משתמש {}",
+                    originalFileName, chatSession.getId(), sessionUser.getUsername());
             throw new IllegalArgumentException("קובץ עם שם זהה כבר קיים בשיחה");
         }
 
-        // חישוב hash של התוכן למניעת כפילויות
+        // חישוב hash של התוכן למניעת כפילויות לפי משתמש
         String contentHash = calculateFileHash(file.getBytes());
         Optional<Document> duplicateDoc = documentRepository
-                .findByUserAndContentHash(chatSession.getUser(), contentHash);
+                .findByUserAndContentHash(sessionUser, contentHash);
 
         if (duplicateDoc.isPresent()) {
-            log.warn("קובץ עם תוכן זהה כבר קיים למשתמש");
-            throw new IllegalArgumentException("קובץ עם תוכן זהה כבר קיים");
+            log.warn("קובץ עם תוכן זהה כבר קיים למשתמש {} (מסמך קיים: {})",
+                    sessionUser.getUsername(), duplicateDoc.get().getId());
+            throw new IllegalArgumentException("קובץ עם תוכן זהה כבר קיים למשתמש זה");
         }
 
-        // יצירת רשומת Document חדשה
+        // יצירת רשומת Document חדשה עם קישור מפורש למשתמש
         Document document = new Document();
-        document.setFileName(generateUniqueFileName(originalFileName));
+        document.setFileName(generateUniqueFileName(originalFileName, sessionUser.getId()));
         document.setOriginalFileName(originalFileName);
         document.setFileType(getFileExtension(originalFileName));
         document.setFileSize(file.getSize());
         document.setContentHash(contentHash);
         document.setProcessingStatus(Document.ProcessingStatus.PROCESSING);
         document.setProcessingProgress(0);
-        document.setUser(chatSession.getUser());
+
+        // קישור מפורש למשתמש ולשיחה
+        document.setUser(sessionUser);
         document.setChatSession(chatSession);
-        document.setVectorCollectionName("smart_documents"); // כרגע קולקשן אחד
+        document.setVectorCollectionName("smart_documents_user_" + sessionUser.getId());
 
         // שמירה במסד הנתונים
         document = documentRepository.save(document);
@@ -77,7 +85,8 @@ public class PdfProcessingService {
         try {
             // עיבוד הקובץ
             dev.langchain4j.data.document.Document langchainDoc =
-                    createDocumentFromInputStream(file.getInputStream(), originalFileName, document.getId().toString());
+                    createDocumentFromInputStream(file.getInputStream(), originalFileName,
+                            document.getId().toString(), sessionUser);
 
             document.setCharacterCount(langchainDoc.text().length());
 
@@ -96,13 +105,14 @@ public class PdfProcessingService {
             document = documentRepository.save(document);
 
             // Invalidate caches after successful processing
-            invalidateDocumentCache(document.getId(), chatSession.getId());
+            invalidateDocumentCache(document.getId(), chatSession.getId(), sessionUser.getId());
 
-            log.info("קובץ {} עובד בהצלחה עם {} תווים", originalFileName, langchainDoc.text().length());
+            log.info("קובץ {} עובד בהצלחה עם {} תווים עבור משתמש {} (מסמך ID: {})",
+                    originalFileName, langchainDoc.text().length(), sessionUser.getUsername(), document.getId());
             return document;
 
         } catch (Exception e) {
-            log.error("שגיאה בעיבוד קובץ PDF: {}", originalFileName, e);
+            log.error("שגיאה בעיבוד קובץ PDF: {} עבור משתמש {}", originalFileName, sessionUser.getUsername(), e);
 
             // עדכון סטטוס שגיאה
             document.setProcessingStatus(Document.ProcessingStatus.FAILED);
@@ -115,83 +125,163 @@ public class PdfProcessingService {
     }
 
     /**
-     * קבלת כל המסמכים של שיחה עם caching
+     * קבלת כל המסמכים של שיחה עם caching והרשאות
      */
     public List<Document> getDocumentsBySession(ChatSession chatSession) {
-        String cacheKey = "session_docs:" + chatSession.getId();
+        validateChatSession(chatSession);
+
+        String cacheKey = "session_docs:" + chatSession.getId() + "_user:" + chatSession.getUser().getId();
 
         @SuppressWarnings("unchecked")
         List<Document> cachedDocs = (List<Document>) cacheService.getDocumentMetadata(cacheKey);
 
         if (cachedDocs != null) {
-            log.debug("Documents for session {} retrieved from cache", chatSession.getId());
+            log.debug("Documents for session {} (user {}) retrieved from cache",
+                    chatSession.getId(), chatSession.getUser().getId());
             return cachedDocs;
         }
 
-        // Get from database
+        // Get from database with user verification
         List<Document> documents = documentRepository.findByChatSessionAndActiveTrueOrderByCreatedAtDesc(chatSession);
+
+        // Verify all documents belong to the session's user (security check)
+        documents = documents.stream()
+                .filter(doc -> doc.getUser().getId().equals(chatSession.getUser().getId()))
+                .toList();
 
         // Cache for 6 hours
         cacheService.cacheDocumentMetadata(cacheKey, documents);
-        log.debug("Documents for session {} retrieved from database and cached", chatSession.getId());
+        log.debug("Documents for session {} (user {}) retrieved from database and cached",
+                chatSession.getId(), chatSession.getUser().getId());
 
         return documents;
     }
 
     /**
-     * קבלת מסמך לפי ID עם caching
+     * קבלת כל המסמכים של משתמש
      */
-    public Optional<Document> getDocumentById(Long documentId) {
-        String cacheKey = "document:" + documentId;
+    public List<Document> getDocumentsByUser(User user) {
+        validateUser(user);
+
+        String cacheKey = "user_docs:" + user.getId();
+
+        @SuppressWarnings("unchecked")
+        List<Document> cachedDocs = (List<Document>) cacheService.getDocumentMetadata(cacheKey);
+
+        if (cachedDocs != null) {
+            log.debug("Documents for user {} retrieved from cache", user.getId());
+            return cachedDocs;
+        }
+
+        List<Document> documents = documentRepository.findByUserOrderByCreatedAtDesc(user);
+
+        // Cache for 30 minutes (shorter for user-wide queries)
+        cacheService.set(cacheKey, documents, java.time.Duration.ofMinutes(30));
+        log.debug("Documents for user {} retrieved from database and cached", user.getId());
+
+        return documents;
+    }
+
+    /**
+     * קבלת מסמך לפי ID עם בדיקת הרשאות משתמש
+     */
+    public Optional<Document> getDocumentById(Long documentId, User requestingUser) {
+        if (documentId == null || documentId <= 0) {
+            log.warn("ניסיון קבלת מסמך עם ID לא תקין: {}", documentId);
+            return Optional.empty();
+        }
+
+        validateUser(requestingUser);
+
+        String cacheKey = "document:" + documentId + "_user:" + requestingUser.getId();
         Document cachedDoc = (Document) cacheService.getDocumentMetadata(cacheKey);
 
         if (cachedDoc != null) {
-            log.debug("Document {} retrieved from cache", documentId);
+            log.debug("Document {} retrieved from cache (user {})", documentId, requestingUser.getId());
             return Optional.of(cachedDoc);
         }
 
         Optional<Document> docOpt = documentRepository.findById(documentId);
 
         if (docOpt.isPresent()) {
+            Document document = docOpt.get();
+
+            // בדיקת הרשאות - וודא שהמסמך שייך למשתמש המבקש
+            if (!document.getUser().getId().equals(requestingUser.getId())) {
+                log.warn("משתמש {} ניסה לגשת למסמך {} של משתמש אחר",
+                        requestingUser.getId(), documentId);
+                return Optional.empty();
+            }
+
             // Cache the document
-            cacheService.cacheDocumentMetadata(cacheKey, docOpt.get());
-            log.debug("Document {} retrieved from database and cached", documentId);
+            cacheService.cacheDocumentMetadata(cacheKey, document);
+            log.debug("Document {} retrieved from database and cached (user {})",
+                    documentId, requestingUser.getId());
         }
 
         return docOpt;
     }
 
     /**
-     * מחיקת מסמך (soft delete) עם cache invalidation
+     * מחיקת מסמך (soft delete) עם בדיקת הרשאות משתמש
      */
-    public boolean deleteDocument(Long documentId, User user) {
-        Optional<Document> docOpt = getDocumentById(documentId);
+    public boolean deleteDocument(Long documentId, User requestingUser) {
+        validateUser(requestingUser);
+
+        Optional<Document> docOpt = getDocumentById(documentId, requestingUser);
         if (docOpt.isPresent()) {
             Document document = docOpt.get();
 
-            // בדיקת הרשאות
-            if (!document.getUser().getId().equals(user.getId())) {
-                log.warn("משתמש {} מנסה למחוק מסמך {} של משתמש אחר",
-                        user.getId(), documentId);
-                return false;
-            }
-
+            // בדיקת הרשאות כבר נעשתה ב-getDocumentById
             document.setActive(false);
             documentRepository.save(document);
 
             // Invalidate caches
-            invalidateDocumentCache(documentId, document.getChatSession().getId());
+            invalidateDocumentCache(documentId, document.getChatSession().getId(), requestingUser.getId());
 
-            log.info("מסמך {} נמחק בהצלחה", document.getOriginalFileName());
+            log.info("מסמך {} ({}) נמחק בהצלחה על ידי משתמש {}",
+                    document.getId(), document.getOriginalFileName(), requestingUser.getUsername());
+            return true;
+        }
+
+        log.warn("ניסיון מחיקת מסמך {} על ידי משתמש {} נכשל - מסמך לא נמצא או אין הרשאה",
+                documentId, requestingUser.getUsername());
+        return false;
+    }
+
+    /**
+     * העברת בעלות על מסמך (לעתיד)
+     */
+    public boolean transferDocumentOwnership(Long documentId, User currentOwner, User newOwner) {
+        validateUser(currentOwner);
+        validateUser(newOwner);
+
+        Optional<Document> docOpt = getDocumentById(documentId, currentOwner);
+        if (docOpt.isPresent()) {
+            Document document = docOpt.get();
+
+            User oldOwner = document.getUser();
+            document.setUser(newOwner);
+
+            documentRepository.save(document);
+
+            // Invalidate caches for both users
+            invalidateDocumentCache(documentId, document.getChatSession().getId(), oldOwner.getId());
+            invalidateDocumentCache(documentId, document.getChatSession().getId(), newOwner.getId());
+
+            log.info("בעלות על מסמך {} הועברה ממשתמש {} למשתמש {}",
+                    documentId, oldOwner.getUsername(), newOwner.getUsername());
             return true;
         }
         return false;
     }
 
     /**
-     * סטטיסטיקות משתמש
+     * סטטיסטיקות משתמש עם caching משופר
      */
     public DocumentStats getUserDocumentStats(User user) {
+        validateUser(user);
+
         String cacheKey = "user_stats:" + user.getId();
         DocumentStats cachedStats = (DocumentStats) cacheService.get(cacheKey);
 
@@ -216,11 +306,27 @@ public class PdfProcessingService {
         return stats;
     }
 
+    /**
+     * קבלת מסמכים לפי שיחה וסטטוס
+     */
+    public List<Document> getDocumentsBySessionAndStatus(ChatSession chatSession,
+                                                         Document.ProcessingStatus status) {
+        validateChatSession(chatSession);
+
+        List<Document> documents = documentRepository.findByUserAndProcessingStatusOrderByCreatedAtDesc(
+                chatSession.getUser(), status);
+
+        // Filter by chat session
+        return documents.stream()
+                .filter(doc -> doc.getChatSession().getId().equals(chatSession.getId()))
+                .toList();
+    }
+
     // Helper methods
 
     private void validateFile(MultipartFile file) {
-        if (file.isEmpty()) {
-            throw new IllegalArgumentException("הקובץ ריק");
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("הקובץ ריק או לא תקין");
         }
 
         String fileName = file.getOriginalFilename();
@@ -233,8 +339,39 @@ public class PdfProcessingService {
         }
     }
 
+    private void validateChatSession(ChatSession chatSession) {
+        if (chatSession == null) {
+            throw new IllegalArgumentException("שיחה לא תקינה");
+        }
+
+        if (!chatSession.getActive()) {
+            throw new IllegalArgumentException("שיחה לא פעילה");
+        }
+
+        validateUser(chatSession.getUser());
+    }
+
+    private void validateChatSessionForUpload(ChatSession chatSession) {
+        validateChatSession(chatSession);
+
+        // בדיקות נוספות לhאעלאת קבצים
+        if (chatSession.getUser() == null) {
+            throw new IllegalArgumentException("שיחה ללא משתמש מקושר");
+        }
+    }
+
+    private void validateUser(User user) {
+        if (user == null) {
+            throw new IllegalArgumentException("משתמש לא תקין");
+        }
+
+        if (!user.getActive()) {
+            throw new SecurityException("משתמש לא פעיל");
+        }
+    }
+
     private dev.langchain4j.data.document.Document createDocumentFromInputStream(
-            InputStream inputStream, String fileName, String documentId) throws IOException {
+            InputStream inputStream, String fileName, String documentId, User user) throws IOException {
 
         ApachePdfBoxDocumentParser parser = new ApachePdfBoxDocumentParser();
         byte[] fileBytes = inputStream.readAllBytes();
@@ -246,17 +383,19 @@ public class PdfProcessingService {
                 throw new IOException("הקובץ נפרסר אבל לא מכיל טקסט");
             }
 
-            // הוספת metadata
+            // הוספת metadata עם פרטי משתמש
             document.metadata().add("source", fileName);
             document.metadata().add("document_id", documentId);
+            document.metadata().add("user_id", user.getId().toString());
+            document.metadata().add("username", user.getUsername());
             document.metadata().add("upload_time", LocalDateTime.now().toString());
 
             return document;
         }
     }
 
-    private String generateUniqueFileName(String originalFileName) {
-        return java.util.UUID.randomUUID().toString().substring(0, 8) + "_" +
+    private String generateUniqueFileName(String originalFileName, Long userId) {
+        return userId + "_" + java.util.UUID.randomUUID().toString().substring(0, 8) + "_" +
                 originalFileName.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 
@@ -286,21 +425,25 @@ public class PdfProcessingService {
     }
 
     /**
-     * פינוי cache של מסמכים
+     * פינוי cache של מסמכים עם הקשר משתמש
      */
-    private void invalidateDocumentCache(Long documentId, Long sessionId) {
+    private void invalidateDocumentCache(Long documentId, Long sessionId, Long userId) {
         // Invalidate individual document cache
-        cacheService.delete("document:" + documentId);
+        cacheService.delete("document:" + documentId + "_user:" + userId);
 
         // Invalidate session documents cache
         if (sessionId != null) {
-            cacheService.delete("session_docs:" + sessionId);
+            cacheService.delete("session_docs:" + sessionId + "_user:" + userId);
         }
 
-        // Invalidate user stats cache (we don't have user ID here, but it's OK)
-        // Stats cache has short TTL anyway
+        // Invalidate user documents cache
+        cacheService.delete("user_docs:" + userId);
 
-        log.debug("Invalidated document cache for document {} and session {}", documentId, sessionId);
+        // Invalidate user stats cache
+        cacheService.delete("user_stats:" + userId);
+
+        log.debug("Invalidated document cache for document {}, session {} and user {}",
+                documentId, sessionId, userId);
     }
 
     // Inner class for statistics
