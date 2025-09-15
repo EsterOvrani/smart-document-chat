@@ -52,6 +52,10 @@ public class User {
     @OneToMany(mappedBy = "user", cascade = CascadeType.ALL, orphanRemoval = true)
     private List<ChatSession> chatSessions = new ArrayList<>();
 
+    // Relationship to UserPreferences (One-to-One)
+    @OneToOne(mappedBy = "user", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    private UserPreferences preferences;
+
     // Helper methods
     public String getFullName() {
         if (firstName == null && lastName == null) {
@@ -78,5 +82,16 @@ public class User {
 
     public int getChatSessionCount() {
         return chatSessions.size();
+    }
+
+    public void setPreferences(UserPreferences preferences) {
+        this.preferences = preferences;
+        if (preferences != null) {
+            preferences.setUser(this);
+        }
+    }
+
+    public boolean hasPreferences() {
+        return preferences != null;
     }
 }
