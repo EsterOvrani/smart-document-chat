@@ -1,7 +1,7 @@
 package com.smartdocumentchat.controller;
 
-import com.smartdocumentchat.PdfProcessingService;
-import com.smartdocumentchat.QdrantVectorService;
+import com.smartdocumentchat.service.PdfProcessingService;
+import com.smartdocumentchat.service.QdrantVectorService;
 import com.smartdocumentchat.entity.ChatSession;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.service.ChatSessionService;

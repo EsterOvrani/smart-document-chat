@@ -1,5 +1,6 @@
-package com.smartdocumentchat;
+package com.smartdocumentchat.service;
 
+import com.smartdocumentchat.config.QdrantProperties;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.data.segment.TextSegment;
 import lombok.RequiredArgsConstructor;
