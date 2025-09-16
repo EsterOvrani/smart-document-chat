@@ -1,5 +1,7 @@
-package com.smartdocumentchat;
+package com.smartdocumentchat.controller;
 
+import com.smartdocumentchat.PdfProcessingService;
+import com.smartdocumentchat.QdrantVectorService;
 import com.smartdocumentchat.entity.ChatSession;
 import com.smartdocumentchat.entity.Document;
 import com.smartdocumentchat.entity.User;
@@ -36,38 +38,50 @@ public class ChatController {
     private final QuestionHashService questionHashService;
 
     /**
-     * העלאה ועיבוד קובץ PDF חדש לשיחה
+     * העלאה ועיבוד קובץ PDF חדש לשיחה עם תמיכה בהקשר משתמש
      */
     @PostMapping("/upload-pdf")
     public ResponseEntity<?> uploadPdf(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(value = "sessionId", required = false) Long sessionId) {
+            @RequestParam(value = "sessionId", required = false) Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
         try {
-            // קבלת או יצירת משתמש דמה (זמני עד שלב 9)
-            User demoUser = userService.getOrCreateDemoUser();
+            // קבלת המשתמש - עם תמיכה בהעברת userId או שימוש בדמו
+            User currentUser = getCurrentUser(userId);
 
             // קבלת או יצירת שיחה
             ChatSession chatSession;
             if (sessionId != null) {
                 Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
-                if (sessionOpt.isEmpty() || !chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+                if (sessionOpt.isEmpty()) {
                     return ResponseEntity.badRequest().body(Map.of(
                             "success", false,
-                            "error", "שיחה לא נמצאה או שאין הרשאה"
+                            "error", "שיחה לא נמצאה"
                     ));
                 }
+
                 chatSession = sessionOpt.get();
+
+                // בדיקת הרשאות - וודא שהשיחה שייכת למשתמש
+                if (!isUserAuthorizedForSession(currentUser, chatSession)) {
+                    log.warn("משתמש {} ניסה לגשת לשיחה {} שלא שייכת לו",
+                            currentUser.getId(), sessionId);
+                    return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                            "success", false,
+                            "error", "אין הרשאה לשיחה זו"
+                    ));
+                }
             } else {
                 // צור שיחה חדשה
                 String sessionTitle = "שיחה עם " + file.getOriginalFilename();
-                chatSession = chatSessionService.createSession(demoUser, sessionTitle, "שיחה לעיבוד מסמך");
+                chatSession = chatSessionService.createSession(currentUser, sessionTitle, "שיחה לעיבוד מסמך");
             }
 
             // עיבוד הקובץ
             Document document = pdfProcessingService.processPdfFile(file, chatSession);
 
-            // אחרי הוספת מסמך חדש, נקה cache של Q&A לשיחה זו
-            invalidateSessionCache(chatSession.getId());
+            // פינוי cache לשיחה זו
+            invalidateSessionCache(chatSession.getId(), currentUser.getId());
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -75,9 +89,17 @@ public class ChatController {
                     "documentId", document.getId(),
                     "sessionId", chatSession.getId(),
                     "fileName", document.getOriginalFileName(),
+                    "userId", currentUser.getId(),
                     "uploadTime", document.getCreatedAt().format(
                             java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
                     )
+            ));
+
+        } catch (SecurityException e) {
+            log.warn("שגיאת הרשאות בהעלאת קובץ: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
             ));
 
         } catch (IllegalArgumentException e) {
@@ -104,12 +126,13 @@ public class ChatController {
     }
 
     /**
-     * שאילת שאלה על מסמכי השיחה
+     * שאילת שאלה על מסמכי השיחה עם הקשר משתמש
      */
     @PostMapping("/chat")
     public ResponseEntity<?> chatWithDocuments(
             @RequestBody ChatRequest request,
-            @RequestParam(value = "sessionId", required = false) Long sessionId) {
+            @RequestParam(value = "sessionId", required = false) Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
 
         long startTime = System.currentTimeMillis();
         boolean cacheHit = false;
@@ -122,23 +145,32 @@ public class ChatController {
                 ));
             }
 
-            // קבלת משתמש דמה
-            User demoUser = userService.getOrCreateDemoUser();
+            // קבלת המשתמש
+            User currentUser = getCurrentUser(userId);
 
-            // קבלת שיחה
+            // קבלת שיחה עם בדיקת הרשאות
             ChatSession chatSession;
             if (sessionId != null) {
                 Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
-                if (sessionOpt.isEmpty() || !chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+                if (sessionOpt.isEmpty()) {
                     return ResponseEntity.badRequest().body(Map.of(
                             "success", false,
-                            "error", "שיחה לא נמצאה או שאין הרשאה"
+                            "error", "שיחה לא נמצאה"
                     ));
                 }
+
                 chatSession = sessionOpt.get();
+
+                // בדיקת הרשאות
+                if (!isUserAuthorizedForSession(currentUser, chatSession)) {
+                    return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                            "success", false,
+                            "error", "אין הרשאה לשיחה זו"
+                    ));
+                }
             } else {
-                // נסה לקבל את השיחה האחרונה
-                Optional<ChatSession> lastSession = chatSessionService.getLastSession(demoUser);
+                // נסה לקבל את השיחה האחרונה של המשתמש
+                Optional<ChatSession> lastSession = chatSessionService.getLastSession(currentUser);
                 if (lastSession.isEmpty()) {
                     return ResponseEntity.badRequest().body(Map.of(
                             "success", false,
@@ -157,12 +189,13 @@ public class ChatController {
                 ));
             }
 
-            // יצירת hash לשאלה
+            // יצירת hash לשאלה עם הקשר משתמש
             List<String> documentIds = documents.stream()
                     .map(doc -> doc.getId().toString())
                     .collect(Collectors.toList());
 
-            String questionHash = questionHashService.generateQuestionHash(request.getText(), documentIds);
+            String questionHash = questionHashService.generateQuestionHash(
+                    request.getText() + "_user_" + currentUser.getId(), documentIds);
 
             // בדיקה אם יש תשובה בcache
             String cachedAnswer = cacheService.getCachedQAResult(questionHash);
@@ -171,15 +204,16 @@ public class ChatController {
             if (cachedAnswer != null) {
                 answer = cachedAnswer;
                 cacheHit = true;
-                log.debug("Cache HIT for question hash: {}", questionHash);
+                log.debug("Cache HIT for question hash: {} (user: {})", questionHash, currentUser.getId());
             } else {
                 // אם אין בcache, עבד את השאלה
-                String enhancedQuestion = enhanceQuestion(request.getText(), documents);
+                String enhancedQuestion = enhanceQuestion(request.getText(), documents, currentUser);
                 answer = conversationalRetrievalChain.execute(enhancedQuestion);
 
                 // שמור בcache
                 cacheService.cacheQAResult(questionHash, answer);
-                log.debug("Cache MISS for question hash: {}, answer cached", questionHash);
+                log.debug("Cache MISS for question hash: {}, answer cached (user: {})",
+                        questionHash, currentUser.getId());
             }
 
             // עדכון זמן פעילות השיחה
@@ -187,18 +221,26 @@ public class ChatController {
 
             long processingTime = System.currentTimeMillis() - startTime;
 
-            log.debug("Question processed for session {} in {}ms (cache: {})",
-                    chatSession.getId(), processingTime, cacheHit ? "HIT" : "MISS");
+            log.debug("Question processed for session {} by user {} in {}ms (cache: {})",
+                    chatSession.getId(), currentUser.getId(), processingTime, cacheHit ? "HIT" : "MISS");
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "answer", answer,
                     "originalQuestion", request.getText(),
                     "sessionId", chatSession.getId(),
+                    "userId", currentUser.getId(),
                     "documentsCount", documents.size(),
                     "processingTime", processingTime,
                     "cacheHit", cacheHit,
                     "questionHash", questionHash
+            ));
+
+        } catch (SecurityException e) {
+            log.warn("שגיאת הרשאות בשיחה: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
             ));
 
         } catch (Exception e) {
@@ -211,15 +253,17 @@ public class ChatController {
     }
 
     /**
-     * קבלת מידע על שיחה ספציפית
+     * קבלת מידע על שיחה ספציפית עם בדיקת הרשאות
      */
     @GetMapping("/session/{sessionId}")
-    public ResponseEntity<?> getSessionInfo(@PathVariable Long sessionId) {
+    public ResponseEntity<?> getSessionInfo(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
         try {
-            User demoUser = userService.getOrCreateDemoUser();
+            User currentUser = getCurrentUser(userId);
             Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
 
-            if (sessionOpt.isEmpty() || !chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+            if (sessionOpt.isEmpty()) {
                 return ResponseEntity.badRequest().body(Map.of(
                         "success", false,
                         "error", "שיחה לא נמצאה"
@@ -227,6 +271,15 @@ public class ChatController {
             }
 
             ChatSession session = sessionOpt.get();
+
+            // בדיקת הרשאות
+            if (!isUserAuthorizedForSession(currentUser, session)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
             List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
 
             return ResponseEntity.ok(Map.of(
@@ -235,6 +288,7 @@ public class ChatController {
                             "id", session.getId(),
                             "title", session.getDisplayTitle(),
                             "description", session.getDescription(),
+                            "userId", session.getUser().getId(),
                             "createdAt", session.getCreatedAt().format(
                                     java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
                             ),
@@ -249,6 +303,11 @@ public class ChatController {
                             )).toList()
                     )
             ));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
+            ));
         } catch (Exception e) {
             log.error("שגיאה בקבלת מידע שיחה", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
@@ -259,16 +318,19 @@ public class ChatController {
     }
 
     /**
-     * קבלת רשימת שיחות המשתמש
+     * קבלת רשימת שיחות המשתמש עם data isolation
      */
     @GetMapping("/sessions")
-    public ResponseEntity<?> getUserSessions() {
+    public ResponseEntity<?> getUserSessions(
+            @RequestParam(value = "userId", required = false) Long userId) {
         try {
-            User demoUser = userService.getOrCreateDemoUser();
-            List<ChatSession> sessions = chatSessionService.getUserSessions(demoUser);
+            User currentUser = getCurrentUser(userId);
+            List<ChatSession> sessions = chatSessionService.getUserSessions(currentUser);
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
+                    "userId", currentUser.getId(),
+                    "username", currentUser.getUsername(),
                     "sessions", sessions.stream().map(session -> Map.of(
                             "id", session.getId(),
                             "title", session.getDisplayTitle(),
@@ -281,6 +343,11 @@ public class ChatController {
                     )).toList(),
                     "totalSessions", sessions.size()
             ));
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
+            ));
         } catch (Exception e) {
             log.error("שגיאה בקבלת שיחות", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
@@ -291,20 +358,23 @@ public class ChatController {
     }
 
     /**
-     * בדיקת סטטוס המערכת
+     * בדיקת סטטוס המערכת עם הקשר משתמש
      */
     @GetMapping("/status")
-    public ResponseEntity<?> getSystemStatus() {
+    public ResponseEntity<?> getSystemStatus(
+            @RequestParam(value = "userId", required = false) Long userId) {
         try {
-            User demoUser = userService.getOrCreateDemoUser();
-            long userSessions = chatSessionService.countUserSessions(demoUser);
-            PdfProcessingService.DocumentStats stats = pdfProcessingService.getUserDocumentStats(demoUser);
+            User currentUser = getCurrentUser(userId);
+            long userSessions = chatSessionService.countUserSessions(currentUser);
+            PdfProcessingService.DocumentStats stats = pdfProcessingService.getUserDocumentStats(currentUser);
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "systemStatus", "active",
                     "user", Map.of(
-                            "username", demoUser.getUsername(),
+                            "id", currentUser.getId(),
+                            "username", currentUser.getUsername(),
+                            "fullName", currentUser.getFullName(),
                             "sessionsCount", userSessions
                     ),
                     "documents", Map.of(
@@ -326,7 +396,7 @@ public class ChatController {
 
         } catch (Exception e) {
             log.error("שגיאה בקבלת סטטוס המערכת", e);
-            return ResponseEntity.ok(Map.of(
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
                     "success", false,
                     "error", "שגיאה בקבלת סטטוס המערכת: " + e.getMessage()
             ));
@@ -334,21 +404,31 @@ public class ChatController {
     }
 
     /**
-     * פינוי cache לשיחה ספציפית
+     * פינוי cache לשיחה ספציפית עם בדיקת הרשאות
      */
     @PostMapping("/cache/clear/{sessionId}")
-    public ResponseEntity<?> clearSessionCache(@PathVariable Long sessionId) {
+    public ResponseEntity<?> clearSessionCache(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
         try {
-            User demoUser = userService.getOrCreateDemoUser();
+            User currentUser = getCurrentUser(userId);
 
-            if (!chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+            if (sessionOpt.isEmpty()) {
                 return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            if (!isUserAuthorizedForSession(currentUser, sessionOpt.get())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
                         "success", false,
                         "error", "אין הרשאה לשיחה זו"
                 ));
             }
 
-            invalidateSessionCache(sessionId);
+            invalidateSessionCache(sessionId, currentUser.getId());
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -363,19 +443,96 @@ public class ChatController {
         }
     }
 
+    @PostMapping("/session/{sessionId}/activate")
+    public ResponseEntity<?> activateSession(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            if (!isUserAuthorizedForSession(currentUser, sessionOpt.get())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // הגדר כשיחה פעילה
+            chatSessionService.setActiveSession(currentUser, sessionOpt.get());
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "שיחה הוגדרה כפעילה",
+                    "activeSessionId", sessionId,
+                    "userId", currentUser.getId()
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בהפעלת שיחה", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בהפעלת השיחה"
+            ));
+        }
+    }
+
+    // Private helper methods
+
     /**
-     * שיפור השאלה לדיוק טוב יותר
+     * קבלת המשתמש הנוכחי (זמני עד שלב 9 - Authentication)
      */
-    private String enhanceQuestion(String originalQuestion, List<Document> documents) {
+    private User getCurrentUser(Long userId) {
+        if (userId != null && userId > 0) {
+            Optional<User> userOpt = userService.findById(userId);
+            if (userOpt.isPresent() && userOpt.get().getActive()) {
+                return userOpt.get();
+            } else {
+                log.warn("ניסיון גישה עם userId לא תקין או משתמש לא פעיל: {}", userId);
+                throw new SecurityException("משתמש לא נמצא או לא פעיל");
+            }
+        }
+
+        // אם לא הועבר userId, השתמש במשתמש הדמו (זמני)
+        return userService.getOrCreateDemoUser();
+    }
+
+    /**
+     * בדיקת הרשאות - וודא שהמשתמש מורשה לגשת לשיחה
+     */
+    private boolean isUserAuthorizedForSession(User user, ChatSession session) {
+        if (user == null || session == null) {
+            return false;
+        }
+
+        // וודא שהשיחה שייכת למשתמש ושהיא פעילה
+        return session.getUser().getId().equals(user.getId()) &&
+                session.getActive() &&
+                user.getActive();
+    }
+
+    /**
+     * שיפור השאלה עם הקשר משתמש
+     */
+    private String enhanceQuestion(String originalQuestion, List<Document> documents, User user) {
         StringBuilder documentsList = new StringBuilder();
         for (Document doc : documents) {
             documentsList.append("- ").append(doc.getOriginalFileName()).append("\n");
         }
 
         String enhancedQuestion = String.format(
-                "בהתבסס על המסמכים הבאים שהועלו למערכת:\n%s\nענה על השאלה: %s\n\n" +
+                "בהתבסס על המסמכים הבאים שהועלו למערכת על ידי %s:\n%s\nענה על השאלה: %s\n\n" +
                         "חשוב: ענה רק על בסיס המידע שמופיע במסמכים האלה בלבד.",
-                documentsList.toString(), originalQuestion
+                user.getFullName() != null ? user.getFullName() : user.getUsername(),
+                documentsList.toString(),
+                originalQuestion
         );
 
         // שיפורים ספציפיים לסוגי שאלות נפוצות
@@ -390,49 +547,14 @@ public class ChatController {
     }
 
     /**
-     * פינוי cache של שיחה ספציפית
+     * פינוי cache של שיחה ספציפית עם הקשר משתמש
      */
-    private void invalidateSessionCache(Long sessionId) {
-        // כרגע לא מימשנו cache לפי session, אבל נוסיף בעתיד
-        log.debug("Invalidating cache for session: {}", sessionId);
-    }
+    private void invalidateSessionCache(Long sessionId, Long userId) {
+        // נקה cache ספציפי למשתמש ולשיחה
+        String userSessionKey = "user_" + userId + "_session_" + sessionId;
+        cacheService.delete(userSessionKey);
 
-    @PostMapping("/session/{sessionId}/activate")
-    public ResponseEntity<?> activateSession(@PathVariable Long sessionId) {
-        try {
-            User demoUser = userService.getOrCreateDemoUser();
-
-            if (!chatSessionService.isSessionOwnedByUser(sessionId, demoUser)) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "אין הרשאה לשיחה זו"
-                ));
-            }
-
-            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
-            if (sessionOpt.isEmpty()) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "שיחה לא נמצאה"
-                ));
-            }
-
-            // הגדר כשיחה פעילה
-            chatSessionService.setActiveSession(demoUser, sessionOpt.get());
-
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "message", "שיחה הוגדרה כפעילה",
-                    "activeSessionId", sessionId
-            ));
-
-        } catch (Exception e) {
-            log.error("שגיאה בהפעלת שיחה", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "error", "שגיאה בהפעלת השיחה"
-            ));
-        }
+        log.debug("Invalidating cache for session: {} and user: {}", sessionId, userId);
     }
 
     /**
