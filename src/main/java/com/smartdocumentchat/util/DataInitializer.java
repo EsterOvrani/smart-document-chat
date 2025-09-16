@@ -1,8 +1,10 @@
-package com.smartdocumentchat.service;
+package com.smartdocumentchat.util;
 
 import com.smartdocumentchat.entity.ChatSession;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.repository.UserRepository;
+import com.smartdocumentchat.service.ChatSessionService;
+import com.smartdocumentchat.service.UserService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;

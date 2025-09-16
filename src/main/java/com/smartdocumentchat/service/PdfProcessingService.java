@@ -1,12 +1,14 @@
 package com.smartdocumentchat.service;
 
+import com.smartdocumentchat.config.QdrantConfig;
 import com.smartdocumentchat.entity.ChatSession;
 import com.smartdocumentchat.entity.Document;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.repository.DocumentRepository;
-import com.smartdocumentchat.service.CacheService;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentParser;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +32,8 @@ public class PdfProcessingService {
     private final EmbeddingStoreIngestor embeddingStoreIngestor;
     private final DocumentRepository documentRepository;
     private final CacheService cacheService;
+    private final QdrantVectorService qdrantVectorService;
+    private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
 
     /**
      * עיבוד קובץ PDF חדש לשיחה ספציפית עם תמיכה בקבצים מרובים
@@ -77,7 +81,11 @@ public class PdfProcessingService {
         // קישור מפורש למשתמש ולשיחה הספציפית
         document.setUser(sessionUser);
         document.setChatSession(chatSession);
-        document.setVectorCollectionName("session_" + chatSession.getId() + "_user_" + sessionUser.getId());
+
+        // עדכון: שימוש בcollection name מה-QdrantVectorService
+        String sessionCollectionName = qdrantVectorService.generateSessionCollectionName(
+                chatSession.getId(), sessionUser.getId());
+        document.setVectorCollectionName(sessionCollectionName);
 
         // שמירה במסד הנתונים
         document = documentRepository.save(document);
@@ -90,8 +98,16 @@ public class PdfProcessingService {
 
             document.setCharacterCount(langchainDoc.text().length());
 
-            // הכנסה לmוקטור database עם collection נפרד לכל שיחה
-            embeddingStoreIngestor.ingest(langchainDoc);
+            // **עדכון מרכזי: שימוש ב-session-specific embedding store**
+            EmbeddingStore<TextSegment> sessionEmbeddingStore =
+                    qdrantVectorService.getEmbeddingStoreForSession(chatSession);
+
+            // יצירת ingestor ספציפי לsession
+            EmbeddingStoreIngestor sessionIngestor =
+                    ingestorFactory.createIngestorForStore(sessionEmbeddingStore);
+
+            // הכנסה ל-vector database עם collection נפרד לכל שיחה
+            sessionIngestor.ingest(langchainDoc);
 
             // עדכון סטטוס השלמה
             document.setProcessingStatus(Document.ProcessingStatus.COMPLETED);
@@ -107,9 +123,9 @@ public class PdfProcessingService {
             // Invalidate caches after successful processing
             invalidateSessionDocumentCache(chatSession.getId(), sessionUser.getId());
 
-            log.info("קובץ {} עובד בהצלחה עם {} תווים עבור שיחה {} של משתמש {} (מסמך ID: {})",
+            log.info("קובץ {} עובד בהצלחה עם {} תווים עבור שיחה {} של משתמש {} (מסמך ID: {}, Collection: {})",
                     originalFileName, langchainDoc.text().length(), chatSession.getId(),
-                    sessionUser.getUsername(), document.getId());
+                    sessionUser.getUsername(), document.getId(), sessionCollectionName);
             return document;
 
         } catch (Exception e) {
