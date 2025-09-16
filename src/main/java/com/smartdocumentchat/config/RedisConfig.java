@@ -1,4 +1,4 @@
-package com.smartdocumentchat;
+package com.smartdocumentchat.config;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
