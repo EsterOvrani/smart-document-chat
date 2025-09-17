@@ -352,7 +352,7 @@ public class ChatSessionService {
     }
 
     /**
-     * קביעת שיחה כפעילה למשתמש
+     * קביעת שיחה כפעילה למשתמש עם שמירת השיחה הקודמת
      */
     public void setActiveSession(User user, ChatSession session) {
         validateUser(user);
@@ -362,13 +362,23 @@ public class ChatSessionService {
         }
 
         String cacheKey = "active_session:" + user.getId();
+
+        // שמירת השיחה הנוכחית כקודמת לפני החלפה
+        ChatSession currentActive = (ChatSession) cacheService.get(cacheKey);
+        if (currentActive != null && !currentActive.getId().equals(session.getId())) {
+            String previousSessionKey = "previous_session:" + user.getId();
+            cacheService.set(previousSessionKey, currentActive.getId(), java.time.Duration.ofHours(1));
+        }
+
+        // קביעת השיחה החדשה כפעילה
         cacheService.set(cacheKey, session, java.time.Duration.ofHours(2));
 
-        // Also update last activity
+        // עדכון פעילות השיחה
         updateLastActivity(session.getId());
 
         log.debug("Set active session {} for user {}", session.getId(), user.getId());
     }
+
 
     /**
      * קבלת השיחה הפעילה של משתמש
@@ -380,16 +390,23 @@ public class ChatSessionService {
         ChatSession activeSession = (ChatSession) cacheService.get(cacheKey);
 
         if (activeSession != null) {
-            // Verify the session is still valid
+            // בדיקה שהשיחה עדיין תקינה
             if (isSessionOwnedByUser(activeSession.getId(), user)) {
                 log.debug("Active session {} retrieved from cache for user {}",
                         activeSession.getId(), user.getId());
                 return Optional.of(activeSession);
             } else {
-                // Remove invalid session from cache
+                // הסרת שיחה לא תקינה מהcache
                 cacheService.delete(cacheKey);
                 log.warn("Removed invalid active session from cache for user {}", user.getId());
             }
+        }
+
+        // אם אין שיחה פעילה, נסה להחזיר את השיחה האחרונה
+        Optional<ChatSession> lastSession = getLastSession(user);
+        if (lastSession.isPresent()) {
+            setActiveSession(user, lastSession.get());
+            return lastSession;
         }
 
         return Optional.empty();
@@ -460,6 +477,25 @@ public class ChatSessionService {
         }
 
         return archivedCount;
+    }
+
+    /**
+     * קבלת השיחה הקודמת של משתמש
+     */
+    public Optional<ChatSession> getPreviousSession(User user) {
+        validateUser(user);
+
+        String previousSessionKey = "previous_session:" + user.getId();
+        Long previousSessionId = (Long) cacheService.get(previousSessionKey);
+
+        if (previousSessionId != null) {
+            Optional<ChatSession> sessionOpt = findById(previousSessionId);
+            if (sessionOpt.isPresent() && isSessionOwnedByUser(previousSessionId, user)) {
+                return sessionOpt;
+            }
+        }
+
+        return Optional.empty();
     }
 
     // Private helper methods
