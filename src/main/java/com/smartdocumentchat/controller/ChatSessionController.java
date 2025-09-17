@@ -1,5 +1,6 @@
 package com.smartdocumentchat.controller;
 
+import com.smartdocumentchat.config.QdrantConfig;
 import com.smartdocumentchat.service.PdfProcessingService;
 import com.smartdocumentchat.service.QdrantVectorService;
 import com.smartdocumentchat.entity.ChatSession;
@@ -10,6 +11,8 @@ import com.smartdocumentchat.service.UserService;
 import com.smartdocumentchat.service.CacheService;
 import com.smartdocumentchat.service.QuestionHashService;
 import dev.langchain4j.chain.ConversationalRetrievalChain;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.store.embedding.EmbeddingStore;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -36,6 +39,7 @@ public class ChatSessionController {
     private final ChatSessionService chatSessionService;
     private final CacheService cacheService;
     private final QuestionHashService questionHashService;
+    private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
 
     /**
      * קבלת פרטי השיחה הפעילה (פאנל ימין)
@@ -224,13 +228,15 @@ public class ChatSessionController {
                 ));
             }
 
-            // יצירת hash לשאלה עם הקשר משתמש
+            // יצירת hash לשאלה עם הקשר שיחה-משתמש
             List<String> documentIds = documents.stream()
                     .map(doc -> doc.getId().toString())
                     .collect(Collectors.toList());
 
+            // **עדכון מרכזי: שימוש ב-session ID ב-hash**
             String questionHash = questionHashService.generateQuestionHash(
-                    request.getText() + "_user_" + currentUser.getId(), documentIds);
+                    request.getText() + "_session_" + sessionId + "_user_" + currentUser.getId(),
+                    documentIds);
 
             // בדיקה אם יש תשובה בcache
             String cachedAnswer = cacheService.getCachedQAResult(questionHash);
@@ -239,16 +245,30 @@ public class ChatSessionController {
             if (cachedAnswer != null) {
                 answer = cachedAnswer;
                 cacheHit = true;
-                log.debug("Cache HIT for question hash: {} (user: {})", questionHash, currentUser.getId());
+                log.debug("Cache HIT for question hash: {} (session: {}, user: {})",
+                        questionHash, sessionId, currentUser.getId());
             } else {
-                // אם אין בcache, עבד את השאלה
-                String enhancedQuestion = enhanceQuestion(request.getText(), documents, currentUser);
-                answer = conversationalRetrievalChain.execute(enhancedQuestion);
+                // **עדכון מרכזי: שימוש ב-session-specific retrieval chain**
+
+                // קבלת embedding store ספציפי לשיחה
+                EmbeddingStore<TextSegment> sessionEmbeddingStore =
+                        qdrantVectorService.getEmbeddingStoreForSession(chatSession);
+
+                // יצירת retrieval chain ספציפי לשיחה
+                ConversationalRetrievalChain sessionChain =
+                        ingestorFactory.createChainForStore(sessionEmbeddingStore);
+
+                // עיבוד השאלה עם הקשר של השיחה
+                String enhancedQuestion = enhanceQuestionForSession(request.getText(), documents,
+                        currentUser, chatSession);
+
+                // ביצוע השאלה עם ה-chain הספציפי לשיחה
+                answer = sessionChain.execute(enhancedQuestion);
 
                 // שמור בcache
                 cacheService.cacheQAResult(questionHash, answer);
-                log.debug("Cache MISS for question hash: {}, answer cached (user: {})",
-                        questionHash, currentUser.getId());
+                log.debug("Cache MISS for question hash: {}, answer cached (session: {}, user: {})",
+                        questionHash, sessionId, currentUser.getId());
             }
 
             // עדכון זמן פעילות השיחה
@@ -256,8 +276,10 @@ public class ChatSessionController {
 
             long processingTime = System.currentTimeMillis() - startTime;
 
-            log.debug("Question processed for session {} by user {} in {}ms (cache: {})",
-                    chatSession.getId(), currentUser.getId(), processingTime, cacheHit ? "HIT" : "MISS");
+            log.info("Question processed for session {} by user {} in {}ms (cache: {}, collection: {})",
+                    chatSession.getId(), currentUser.getId(), processingTime,
+                    cacheHit ? "HIT" : "MISS",
+                    qdrantVectorService.generateSessionCollectionName(sessionId, currentUser.getId()));
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -268,7 +290,8 @@ public class ChatSessionController {
                     "documentsCount", documents.size(),
                     "processingTime", processingTime,
                     "cacheHit", cacheHit,
-                    "questionHash", questionHash
+                    "questionHash", questionHash,
+                    "collectionName", qdrantVectorService.generateSessionCollectionName(sessionId, currentUser.getId())
             ));
 
         } catch (SecurityException e) {
@@ -480,6 +503,150 @@ public class ChatSessionController {
         }
     }
 
+    /**
+     * קבלת מידע על collection של השיחה
+     */
+    @GetMapping("/{sessionId}/collection-info")
+    public ResponseEntity<?> getSessionCollectionInfo(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            ChatSession session = sessionOpt.get();
+
+            if (!isUserAuthorizedForSession(currentUser, session)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            String collectionName = qdrantVectorService.generateSessionCollectionName(
+                    sessionId, currentUser.getId());
+
+            boolean hasEmbeddingStore = qdrantVectorService.hasEmbeddingStoreForSession(
+                    sessionId, currentUser.getId());
+
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
+            long processedDocs = documents.stream().filter(Document::isProcessed).count();
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "sessionId", sessionId,
+                    "collectionName", collectionName,
+                    "hasEmbeddingStore", hasEmbeddingStore,
+                    "totalDocuments", documents.size(),
+                    "processedDocuments", processedDocs,
+                    "sessionTitle", session.getDisplayTitle(),
+                    "vectorStoreReady", processedDocs > 0
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בקבלת מידע על collection", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בקבלת מידע על collection"
+            ));
+        }
+    }
+
+    /**
+     * ניקוי collection של שיחה (למקרה של בעיות)
+     */
+    @PostMapping("/{sessionId}/clear-collection")
+    public ResponseEntity<?> clearSessionCollection(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            if (!isUserAuthorizedForSession(currentUser, sessionOpt.get())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // הסרה מהcache (הcollection עצמו ב-Qdrant יישאר)
+            qdrantVectorService.removeEmbeddingStoreForSession(sessionId, currentUser.getId());
+
+            // פינוי cache מקושר
+            invalidateSessionCache(sessionId, currentUser.getId());
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "Collection cache נוקה בהצלחה",
+                    "sessionId", sessionId
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בניקוי collection", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בניקוי collection"
+            ));
+        }
+    }
+
+    /**
+     * קבלת סטטיסטיקות collections כלליות למשתמש
+     */
+    @GetMapping("/collections-stats")
+    public ResponseEntity<?> getCollectionsStats(
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+
+            List<ChatSession> userSessions = chatSessionService.getUserSessions(currentUser);
+
+            int totalSessions = userSessions.size();
+            int sessionsWithDocuments = 0;
+            int totalProcessedDocuments = 0;
+
+            for (ChatSession session : userSessions) {
+                List<Document> docs = pdfProcessingService.getDocumentsBySession(session);
+                if (!docs.isEmpty()) {
+                    sessionsWithDocuments++;
+                    totalProcessedDocuments += (int) docs.stream().filter(Document::isProcessed).count();
+                }
+            }
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "userId", currentUser.getId(),
+                    "totalSessions", totalSessions,
+                    "sessionsWithDocuments", sessionsWithDocuments,
+                    "totalProcessedDocuments", totalProcessedDocuments,
+                    "activeCollections", qdrantVectorService.getActiveCollectionsCount(),
+                    "qdrantStats", qdrantVectorService.getUsageStats()
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בקבלת סטטיסטיקות collections", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בקבלת סטטיסטיקות collections"
+            ));
+        }
+    }
+
     // Helper methods
 
     private User getCurrentUser(Long userId) {
@@ -538,15 +705,20 @@ public class ChatSessionController {
         return summary;
     }
 
-    private String enhanceQuestion(String originalQuestion, List<Document> documents, User user) {
+    /**
+     * מתודה חדשה לשיפור השאלה עם הקשר השיחה
+     */
+    private String enhanceQuestionForSession(String originalQuestion, List<Document> documents,
+                                             User user, ChatSession chatSession) {
         StringBuilder documentsList = new StringBuilder();
         for (Document doc : documents) {
             documentsList.append("- ").append(doc.getOriginalFileName()).append("\n");
         }
 
         String enhancedQuestion = String.format(
-                "בהתבסס על המסמכים הבאים שהועלו למערכת על ידי %s:\n%s\nענה על השאלה: %s\n\n" +
-                        "חשוב: ענה רק על בסיס המידע שמופיע במסמכים האלה בלבד.",
+                "בהקשר של השיחה '%s' עם המסמכים הבאים שהועלו על ידי %s:\n%s\nענה על השאלה: %s\n\n" +
+                        "חשוב: ענה רק על בסיס המידע שמופיע במסמכים האלה בלבד, במסגרת השיחה הזו.",
+                chatSession.getDisplayTitle(),
                 user.getFullName() != null ? user.getFullName() : user.getUsername(),
                 documentsList.toString(),
                 originalQuestion
@@ -554,10 +726,10 @@ public class ChatSessionController {
 
         // שיפורים ספציפיים לסוגי שאלות נפוצות
         String lowerQuestion = originalQuestion.toLowerCase();
-        if (lowerQuestion.contains("שם") || lowerQuestion.contains("name")) {
-            enhancedQuestion += "\n\nחפש שמות של אנשים, חברות, פרויקטים או טכנולוגיות המוזכרים במסמכים.";
-        } else if (lowerQuestion.contains("פרויקט") || lowerQuestion.contains("project")) {
-            enhancedQuestion += "\n\nחפש מידע על פרויקטים, עבודות או התפתחות מקצועית המוזכרת במסמכים.";
+        if (lowerQuestion.contains("השווה") || lowerQuestion.contains("compare")) {
+            enhancedQuestion += "\n\nהשווה מידע בין המסמכים השונים בשיחה הזו.";
+        } else if (lowerQuestion.contains("סיכום") || lowerQuestion.contains("summary")) {
+            enhancedQuestion += "\n\nצור סיכום מקיף על בסיס כל המסמכים בשיחה הזו.";
         }
 
         return enhancedQuestion;
