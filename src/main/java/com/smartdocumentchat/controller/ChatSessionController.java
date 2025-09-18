@@ -24,6 +24,12 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 @RestController
@@ -40,6 +46,9 @@ public class ChatSessionController {
     private final CacheService cacheService;
     private final QuestionHashService questionHashService;
     private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
+
+    // Thread pool for concurrent file processing
+    private final ExecutorService fileProcessingExecutor = Executors.newFixedThreadPool(5);
 
     /**
      * קבלת פרטי השיחה הפעילה (פאנל ימין)
@@ -100,13 +109,16 @@ public class ChatSessionController {
     }
 
     /**
-     * העלאת קובץ PDF לשיחה הפעילה (פאנל ימין)
+     * העלאת קבצים מרובים לשיחה הפעילה (פאנל ימין) - UPDATED FOR MULTIPLE FILES
      */
     @PostMapping("/{sessionId}/documents")
-    public ResponseEntity<?> uploadDocumentToSession(
+    public ResponseEntity<?> uploadMultipleDocumentsToSession(
             @PathVariable Long sessionId,
-            @RequestParam("file") MultipartFile file,
+            @RequestParam("files") MultipartFile[] files,
             @RequestParam(value = "userId", required = false) Long userId) {
+
+        long startTime = System.currentTimeMillis();
+
         try {
             User currentUser = getCurrentUser(userId);
 
@@ -131,49 +143,244 @@ public class ChatSessionController {
                 ));
             }
 
-            // עיבוד הקובץ
-            Document document = pdfProcessingService.processPdfFile(file, chatSession);
+            // בדיקת validation בסיסית
+            if (files == null || files.length == 0) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "לא נבחרו קבצים להעלאה"
+                ));
+            }
+
+            // הגבלת מספר קבצים (מקסימום 10 קבצים בבת אחת)
+            if (files.length > 10) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "ניתן להעלות מקסימום 10 קבצים בבת אחת"
+                ));
+            }
+
+            log.info("מתחיל עיבוד {} קבצים עבור שיחה {} של משתמש {}",
+                    files.length, sessionId, currentUser.getUsername());
+
+            // תוצאות עיבוד
+            List<Map<String, Object>> processedDocuments = new ArrayList<>();
+            List<String> errors = new ArrayList<>();
+            List<CompletableFuture<DocumentProcessingResult>> futures = new ArrayList<>();
+
+            // עיבוד מקבילי של הקבצים
+            for (int i = 0; i < files.length; i++) {
+                final MultipartFile file = files[i];
+                final int fileIndex = i + 1;
+
+                CompletableFuture<DocumentProcessingResult> future = CompletableFuture
+                        .supplyAsync(() -> processFileAsync(file, chatSession, fileIndex), fileProcessingExecutor);
+
+                futures.add(future);
+            }
+
+            // המתנה לכל התוצאות
+            for (int i = 0; i < futures.size(); i++) {
+                try {
+                    DocumentProcessingResult result = futures.get(i).get();
+
+                    if (result.success) {
+                        processedDocuments.add(buildDocumentSummary(result.document));
+                        log.info("קובץ {} עובד בהצלחה: {}",
+                                i + 1, result.document.getOriginalFileName());
+                    } else {
+                        errors.add(String.format("קובץ %d (%s): %s",
+                                i + 1, result.fileName, result.error));
+                        log.warn("שגיאה בעיבוד קובץ {}: {}", i + 1, result.error);
+                    }
+
+                } catch (Exception e) {
+                    errors.add(String.format("קובץ %d: שגיאה לא צפויה - %s", i + 1, e.getMessage()));
+                    log.error("שגיאה לא צפויה בעיבוד קובץ {}", i + 1, e);
+                }
+            }
 
             // פינוי cache לשיחה זו
             invalidateSessionCache(chatSession.getId(), currentUser.getId());
 
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "message", "הקובץ הועלה ועובד בהצלחה",
-                    "document", buildDocumentSummary(document),
-                    "sessionId", chatSession.getId(),
-                    "uploadTime", document.getCreatedAt().format(
-                            java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
-                    )
-            ));
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            // יצירת תשובה
+            Map<String, Object> response = new HashMap<>();
+            response.put("success", true);
+            response.put("totalFiles", files.length);
+            response.put("processedSuccessfully", processedDocuments.size());
+            response.put("failedFiles", errors.size());
+            response.put("processingTimeMs", processingTime);
+            response.put("sessionId", chatSession.getId());
+
+            if (!processedDocuments.isEmpty()) {
+                response.put("documents", processedDocuments);
+            }
+
+            if (!errors.isEmpty()) {
+                response.put("errors", errors);
+            }
+
+            // הודעה מותאמת
+            if (errors.isEmpty()) {
+                response.put("message", String.format("כל %d הקבצים עובדו בהצלחה", files.length));
+            } else if (processedDocuments.isEmpty()) {
+                response.put("message", "כל הקבצים נכשלו בעיבוד");
+                response.put("success", false);
+            } else {
+                response.put("message", String.format("%d קבצים עובדו בהצלחה, %d נכשלו",
+                        processedDocuments.size(), errors.size()));
+            }
+
+            log.info("סיים עיבוד {} קבצים עבור שיחה {}: {} הצליחו, {} נכשלו (זמן: {}ms)",
+                    files.length, sessionId, processedDocuments.size(), errors.size(), processingTime);
+
+            return ResponseEntity.ok(response);
 
         } catch (SecurityException e) {
-            log.warn("שגיאת הרשאות בהעלאת קובץ: {}", e.getMessage());
+            log.warn("שגיאת הרשאות בהעלאת קבצים: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
                     "success", false,
                     "error", e.getMessage()
             ));
 
-        } catch (IllegalArgumentException e) {
-            log.warn("שגיאה בתקינות הקובץ: {}", e.getMessage());
-            return ResponseEntity.badRequest().body(Map.of(
+        } catch (Exception e) {
+            log.error("שגיאה כללית בהעלאת קבצים מרובים", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה לא צפויה בהעלאת הקבצים"
+            ));
+        }
+    }
+
+    /**
+     * העלאת קובץ PDF בודד לשיחה הפעילה (תאימות לאחור)
+     */
+    @PostMapping("/{sessionId}/document")
+    public ResponseEntity<?> uploadSingleDocumentToSession(
+            @PathVariable Long sessionId,
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(value = "userId", required = false) Long userId) {
+
+        // המרה לarray של קובץ אחד וקריאה לmulti-file endpoint
+        MultipartFile[] files = { file };
+        return uploadMultipleDocumentsToSession(sessionId, files, userId);
+    }
+
+    /**
+     * קבלת סטטוס עיבוד קבצים בשיחה
+     */
+    @GetMapping("/{sessionId}/processing-status")
+    public ResponseEntity<?> getProcessingStatus(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            ChatSession session = sessionOpt.get();
+
+            if (!isUserAuthorizedForSession(currentUser, session)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת כל המסמכים בשיחה
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
+
+            // קבלת קבצים בעיבוד
+            Set<String> processingFiles = pdfProcessingService.getProcessingFilesForSession(session);
+
+            // חישוב סטטיסטיקות
+            long totalDocs = documents.size();
+            long completedDocs = documents.stream().filter(Document::isProcessed).count();
+            long failedDocs = documents.stream().filter(Document::hasFailed).count();
+            long processingDocs = documents.stream().filter(Document::isProcessing).count();
+
+            // רשימת מסמכים עם סטטוס
+            List<Map<String, Object>> documentsStatus = documents.stream()
+                    .map(doc -> {
+                        Map<String, Object> docStatus = new HashMap<>();
+                        docStatus.put("id", doc.getId());
+                        docStatus.put("fileName", doc.getOriginalFileName());
+                        docStatus.put("status", doc.getProcessingStatus().toString());
+                        docStatus.put("progress", doc.getProcessingProgress());
+                        docStatus.put("processed", doc.isProcessed());
+                        docStatus.put("failed", doc.hasFailed());
+                        docStatus.put("processing", doc.isProcessing());
+                        docStatus.put("uploadTime", doc.getCreatedAt().format(
+                                java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")));
+                        if (doc.getErrorMessage() != null) {
+                            docStatus.put("errorMessage", doc.getErrorMessage());
+                        }
+                        return docStatus;
+                    })
+                    .toList();
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "sessionId", sessionId,
+                    "processingStatus", Map.of(
+                            "totalDocuments", totalDocs,
+                            "completedDocuments", completedDocs,
+                            "failedDocuments", failedDocs,
+                            "processingDocuments", processingDocs,
+                            "currentlyProcessingFiles", processingFiles.size(),
+                            "processingFileNames", processingFiles,
+                            "isProcessing", processingDocs > 0 || !processingFiles.isEmpty(),
+                            "canUploadMore", processingFiles.size() < 5 // הגבלה של 5 קבצים במקביל
+                    ),
+                    "documents", documentsStatus
+            ));
+
+        } catch (SecurityException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
                     "success", false,
                     "error", e.getMessage()
             ));
+        } catch (Exception e) {
+            log.error("שגיאה בקבלת סטטוס עיבוד לשיחה: {}", sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בקבלת סטטוס העיבוד"
+            ));
+        }
+    }
+
+    /**
+     * עיבוד קובץ בודד באופן אסינכרוני
+     */
+    private DocumentProcessingResult processFileAsync(MultipartFile file, ChatSession chatSession, int fileIndex) {
+        try {
+            log.debug("מתחיל עיבוד קובץ {}: {} (גודל: {})",
+                    fileIndex, file.getOriginalFilename(), formatFileSize(file.getSize()));
+
+            Document document = pdfProcessingService.processPdfFile(file, chatSession);
+
+            return new DocumentProcessingResult(true, document, file.getOriginalFilename(), null);
 
         } catch (IOException e) {
-            log.error("שגיאה בעיבוד הקובץ", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "error", "שגיאה בעיבוד הקובץ: " + e.getMessage()
-            ));
+            log.error("שגיאת IO בעיבוד קובץ {}: {}", fileIndex, file.getOriginalFilename(), e);
+            return new DocumentProcessingResult(false, null, file.getOriginalFilename(),
+                    "שגיאה בעיבוד הקובץ: " + e.getMessage());
+
+        } catch (IllegalArgumentException e) {
+            log.warn("שגיאת validation בקובץ {}: {}", fileIndex, file.getOriginalFilename(), e);
+            return new DocumentProcessingResult(false, null, file.getOriginalFilename(), e.getMessage());
 
         } catch (Exception e) {
-            log.error("שגיאה כללית בהעלאת הקובץ", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "error", "שגיאה לא צפויה בהעלאת הקובץ"
-            ));
+            log.error("שגיאה כללית בעיבוד קובץ {}: {}", fileIndex, file.getOriginalFilename(), e);
+            return new DocumentProcessingResult(false, null, file.getOriginalFilename(),
+                    "שגיאה לא צפויה: " + e.getMessage());
         }
     }
 
@@ -233,7 +440,7 @@ public class ChatSessionController {
                     .map(doc -> doc.getId().toString())
                     .collect(Collectors.toList());
 
-            // **עדכון מרכזי: שימוש ב-session ID ב-hash**
+            // עדכון מרכזי: שימוש ב-session ID ב-hash
             String questionHash = questionHashService.generateQuestionHash(
                     request.getText() + "_session_" + sessionId + "_user_" + currentUser.getId(),
                     documentIds);
@@ -248,7 +455,7 @@ public class ChatSessionController {
                 log.debug("Cache HIT for question hash: {} (session: {}, user: {})",
                         questionHash, sessionId, currentUser.getId());
             } else {
-                // **עדכון מרכזי: שימוש ב-session-specific retrieval chain**
+                // עדכון מרכזי: שימוש ב-session-specific retrieval chain
 
                 // קבלת embedding store ספציפי לשיחה
                 EmbeddingStore<TextSegment> sessionEmbeddingStore =
@@ -740,6 +947,28 @@ public class ChatSessionController {
         cacheService.delete(userSessionKey);
 
         log.debug("Invalidating cache for session: {} and user: {}", sessionId, userId);
+    }
+
+    private String formatFileSize(long size) {
+        if (size < 1024) return size + " B";
+        if (size < 1024 * 1024) return String.format("%.1f KB", size / 1024.0);
+        return String.format("%.1f MB", size / (1024.0 * 1024.0));
+    }
+
+    // Inner classes
+
+    private static class DocumentProcessingResult {
+        final boolean success;
+        final Document document;
+        final String fileName;
+        final String error;
+
+        DocumentProcessingResult(boolean success, Document document, String fileName, String error) {
+            this.success = success;
+            this.document = document;
+            this.fileName = fileName;
+            this.error = error;
+        }
     }
 
     // Request DTO

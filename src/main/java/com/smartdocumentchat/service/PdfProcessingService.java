@@ -22,6 +22,8 @@ import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -35,8 +37,11 @@ public class PdfProcessingService {
     private final QdrantVectorService qdrantVectorService;
     private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
 
+    // Thread-safe tracking of concurrent processing
+    private final Set<String> processingFiles = ConcurrentHashMap.newKeySet();
+
     /**
-     * עיבוד קובץ PDF חדש לשיחה ספציפית עם תמיכה בקבצים מרובים
+     * עיבוד קובץ PDF חדש לשיחה ספציפית עם תמיכה בעיבוד מקבילי
      */
     public Document processPdfFile(MultipartFile file, ChatSession chatSession) throws IOException {
         validateFile(file);
@@ -45,101 +50,154 @@ public class PdfProcessingService {
         String originalFileName = file.getOriginalFilename();
         User sessionUser = chatSession.getUser();
 
-        log.info("מתחיל עיבוד קובץ PDF: {} עבור שיחה: {} של משתמש: {}",
-                originalFileName, chatSession.getId(), sessionUser.getUsername());
+        // יצירת מפתח עבור tracking עיבוד מקבילי
+        String processingKey = generateProcessingKey(chatSession.getId(), sessionUser.getId(), originalFileName);
 
-        // בדיקה אם קובץ עם אותו שם כבר קיים בשיחה הספציפית הזו
-        Optional<Document> existingDoc = documentRepository
-                .findByChatSessionAndFileName(chatSession, originalFileName);
-
-        if (existingDoc.isPresent() && existingDoc.get().getActive()) {
-            log.warn("קובץ עם שם {} כבר קיים בשיחה {} של משתמש {}",
+        // בדיקה אם הקובץ כבר מעובד
+        if (processingFiles.contains(processingKey)) {
+            log.warn("קובץ {} כבר בעיבוד עבור שיחה {} של משתמש {}",
                     originalFileName, chatSession.getId(), sessionUser.getUsername());
-            throw new IllegalArgumentException("קובץ עם שם זהה כבר קיים בשיחה זו");
+            throw new IllegalArgumentException("קובץ עם שם זהה כבר בעיבוד");
         }
 
-        // חישוב hash של התוכן - בודק רק בתוך אותה שיחה
-        String contentHash = calculateFileHash(file.getBytes());
-        Optional<Document> duplicateDoc = findDuplicateInSession(chatSession, contentHash);
+        log.info("מתחיל עיבוד קובץ PDF: {} עבור שיחה: {} של משתמש: {} (Thread: {})",
+                originalFileName, chatSession.getId(), sessionUser.getUsername(), Thread.currentThread().getName());
 
-        if (duplicateDoc.isPresent()) {
-            log.warn("קובץ עם תוכן זהה כבר קיים בשיחה {} (מסמך קיים: {})",
-                    chatSession.getId(), duplicateDoc.get().getId());
-            throw new IllegalArgumentException("קובץ עם תוכן זהה כבר קיים בשיחה זו");
-        }
-
-        // יצירת רשומת Document חדשה עם קישור לשיחה ספציפית
-        Document document = new Document();
-        document.setFileName(generateUniqueFileName(originalFileName, sessionUser.getId(), chatSession.getId()));
-        document.setOriginalFileName(originalFileName);
-        document.setFileType(getFileExtension(originalFileName));
-        document.setFileSize(file.getSize());
-        document.setContentHash(contentHash);
-        document.setProcessingStatus(Document.ProcessingStatus.PROCESSING);
-        document.setProcessingProgress(0);
-
-        // קישור מפורש למשתמש ולשיחה הספציפית
-        document.setUser(sessionUser);
-        document.setChatSession(chatSession);
-
-        // עדכון: שימוש בcollection name מה-QdrantVectorService
-        String sessionCollectionName = qdrantVectorService.generateSessionCollectionName(
-                chatSession.getId(), sessionUser.getId());
-        document.setVectorCollectionName(sessionCollectionName);
-
-        // שמירה במסד הנתונים
-        document = documentRepository.save(document);
+        // הוספה לtracking
+        processingFiles.add(processingKey);
 
         try {
-            // עיבוד הקובץ
-            dev.langchain4j.data.document.Document langchainDoc =
-                    createDocumentFromInputStream(file.getInputStream(), originalFileName,
-                            document.getId().toString(), sessionUser, chatSession);
+            // בדיקה אם קובץ עם אותו שם כבר קיים בשיחה הספציפית הזו
+            Optional<Document> existingDoc = documentRepository
+                    .findByChatSessionAndFileName(chatSession, originalFileName);
 
-            document.setCharacterCount(langchainDoc.text().length());
+            if (existingDoc.isPresent() && existingDoc.get().getActive()) {
+                log.warn("קובץ עם שם {} כבר קיים בשיחה {} של משתמש {}",
+                        originalFileName, chatSession.getId(), sessionUser.getUsername());
+                throw new IllegalArgumentException("קובץ עם שם זהה כבר קיים בשיחה זו");
+            }
 
-            // **עדכון מרכזי: שימוש ב-session-specific embedding store**
-            EmbeddingStore<TextSegment> sessionEmbeddingStore =
-                    qdrantVectorService.getEmbeddingStoreForSession(chatSession);
+            // חישוב hash של התוכן - בודק רק בתוך אותה שיחה
+            String contentHash = calculateFileHash(file.getBytes());
+            Optional<Document> duplicateDoc = findDuplicateInSession(chatSession, contentHash);
 
-            // יצירת ingestor ספציפי לsession
-            EmbeddingStoreIngestor sessionIngestor =
-                    ingestorFactory.createIngestorForStore(sessionEmbeddingStore);
+            if (duplicateDoc.isPresent()) {
+                log.warn("קובץ עם תוכן זהה כבר קיים בשיחה {} (מסמך קיים: {})",
+                        chatSession.getId(), duplicateDoc.get().getId());
+                throw new IllegalArgumentException("קובץ עם תוכן זהה כבר קיים בשיחה זו");
+            }
 
-            // הכנסה ל-vector database עם collection נפרד לכל שיחה
-            sessionIngestor.ingest(langchainDoc);
+            // יצירת רשומת Document חדשה עם קישור לשיחה ספציפית
+            Document document = new Document();
+            document.setFileName(generateUniqueFileName(originalFileName, sessionUser.getId(), chatSession.getId()));
+            document.setOriginalFileName(originalFileName);
+            document.setFileType(getFileExtension(originalFileName));
+            document.setFileSize(file.getSize());
+            document.setContentHash(contentHash);
+            document.setProcessingStatus(Document.ProcessingStatus.PROCESSING);
+            document.setProcessingProgress(0);
 
-            // עדכון סטטוס השלמה
-            document.setProcessingStatus(Document.ProcessingStatus.COMPLETED);
-            document.setProcessingProgress(100);
-            document.setProcessedAt(LocalDateTime.now());
+            // קישור מפורש למשתמש ולשיחה הספציפית
+            document.setUser(sessionUser);
+            document.setChatSession(chatSession);
 
-            // הערכת מספר chunks (בהנחה של 1200 תווים לchunk)
-            int estimatedChunks = (int) Math.ceil(langchainDoc.text().length() / 1200.0);
-            document.setChunkCount(estimatedChunks);
+            // עדכון: שימוש בcollection name מה-QdrantVectorService
+            String sessionCollectionName = qdrantVectorService.generateSessionCollectionName(
+                    chatSession.getId(), sessionUser.getId());
+            document.setVectorCollectionName(sessionCollectionName);
 
+            // שמירה במסד הנתונים
             document = documentRepository.save(document);
 
-            // Invalidate caches after successful processing
-            invalidateSessionDocumentCache(chatSession.getId(), sessionUser.getId());
+            try {
+                // עיבוד הקובץ
+                dev.langchain4j.data.document.Document langchainDoc =
+                        createDocumentFromInputStream(file.getInputStream(), originalFileName,
+                                document.getId().toString(), sessionUser, chatSession);
 
-            log.info("קובץ {} עובד בהצלחה עם {} תווים עבור שיחה {} של משתמש {} (מסמך ID: {}, Collection: {})",
-                    originalFileName, langchainDoc.text().length(), chatSession.getId(),
-                    sessionUser.getUsername(), document.getId(), sessionCollectionName);
-            return document;
+                document.setCharacterCount(langchainDoc.text().length());
 
-        } catch (Exception e) {
-            log.error("שגיאה בעיבוד קובץ PDF: {} עבור שיחה {} של משתמש {}",
-                    originalFileName, chatSession.getId(), sessionUser.getUsername(), e);
+                // עדכון מרכזי: שימוש ב-session-specific embedding store
+                EmbeddingStore<TextSegment> sessionEmbeddingStore =
+                        qdrantVectorService.getEmbeddingStoreForSession(chatSession);
 
-            // עדכון סטטוס שגיאה
-            document.setProcessingStatus(Document.ProcessingStatus.FAILED);
-            document.setProcessingProgress(0);
-            document.setErrorMessage(e.getMessage());
-            documentRepository.save(document);
+                // יצירת ingestor ספציפי לsession
+                EmbeddingStoreIngestor sessionIngestor =
+                        ingestorFactory.createIngestorForStore(sessionEmbeddingStore);
 
-            throw new IOException("לא ניתן לעבד את קובץ ה-PDF: " + e.getMessage(), e);
+                // הכנסה ל-vector database עם collection נפרד לכל שיחה
+                sessionIngestor.ingest(langchainDoc);
+
+                // עדכון סטטוס השלמה
+                document.setProcessingStatus(Document.ProcessingStatus.COMPLETED);
+                document.setProcessingProgress(100);
+                document.setProcessedAt(LocalDateTime.now());
+
+                // הערכת מספר chunks (בהנחה של 1200 תווים לchunk)
+                int estimatedChunks = (int) Math.ceil(langchainDoc.text().length() / 1200.0);
+                document.setChunkCount(estimatedChunks);
+
+                document = documentRepository.save(document);
+
+                // Invalidate caches after successful processing
+                invalidateSessionDocumentCache(chatSession.getId(), sessionUser.getId());
+
+                log.info("קובץ {} עובד בהצלחה עם {} תווים עבור שיחה {} של משתמש {} (מסמך ID: {}, Collection: {}, Thread: {})",
+                        originalFileName, langchainDoc.text().length(), chatSession.getId(),
+                        sessionUser.getUsername(), document.getId(), sessionCollectionName,
+                        Thread.currentThread().getName());
+                return document;
+
+            } catch (Exception e) {
+                log.error("שגיאה בעיבוד קובץ PDF: {} עבור שיחה {} של משתמש {} (Thread: {})",
+                        originalFileName, chatSession.getId(), sessionUser.getUsername(),
+                        Thread.currentThread().getName(), e);
+
+                // עדכון סטטוס שגיאה
+                document.setProcessingStatus(Document.ProcessingStatus.FAILED);
+                document.setProcessingProgress(0);
+                document.setErrorMessage(e.getMessage());
+                documentRepository.save(document);
+
+                throw new IOException("לא ניתן לעבד את קובץ ה-PDF: " + e.getMessage(), e);
+            }
+
+        } finally {
+            // הסרה מtracking בכל מקרה
+            processingFiles.remove(processingKey);
+            log.debug("הוסר מtracking: {}", processingKey);
         }
+    }
+
+    /**
+     * בדיקה אם קובץ בעיבוד (לבדיקת concurrent processing)
+     */
+    public boolean isFileProcessing(ChatSession chatSession, String fileName) {
+        String processingKey = generateProcessingKey(
+                chatSession.getId(),
+                chatSession.getUser().getId(),
+                fileName
+        );
+        return processingFiles.contains(processingKey);
+    }
+
+    /**
+     * קבלת רשימת קבצים בעיבוד לשיחה
+     */
+    public Set<String> getProcessingFilesForSession(ChatSession chatSession) {
+        String sessionPrefix = chatSession.getId() + "_" + chatSession.getUser().getId() + "_";
+
+        return processingFiles.stream()
+                .filter(key -> key.startsWith(sessionPrefix))
+                .map(key -> key.substring(sessionPrefix.length()))
+                .collect(Collectors.toSet());
+    }
+
+    /**
+     * ספירת קבצים בעיבוד כרגע
+     */
+    public int getCurrentProcessingCount() {
+        return processingFiles.size();
     }
 
     /**
@@ -379,7 +437,11 @@ public class PdfProcessingService {
         return !processedDocs.isEmpty();
     }
 
-    // Helper methods
+    // Helper methods for concurrent processing
+
+    private String generateProcessingKey(Long sessionId, Long userId, String fileName) {
+        return sessionId + "_" + userId + "_" + fileName;
+    }
 
     private Optional<Document> findDuplicateInSession(ChatSession chatSession, String contentHash) {
         // מציאת כפילויות רק בתוך אותה שיחה
@@ -458,6 +520,7 @@ public class PdfProcessingService {
             document.metadata().add("session_id", chatSession.getId().toString());
             document.metadata().add("session_title", chatSession.getDisplayTitle());
             document.metadata().add("upload_time", LocalDateTime.now().toString());
+            document.metadata().add("thread_name", Thread.currentThread().getName());
 
             return document;
         }
