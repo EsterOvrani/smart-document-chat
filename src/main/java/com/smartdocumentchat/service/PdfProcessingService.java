@@ -4,6 +4,7 @@ import com.smartdocumentchat.config.QdrantConfig;
 import com.smartdocumentchat.entity.ChatSession;
 import com.smartdocumentchat.entity.Document;
 import com.smartdocumentchat.entity.User;
+import com.smartdocumentchat.event.DocumentProcessingEvent;
 import com.smartdocumentchat.repository.DocumentRepository;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentParser;
@@ -35,9 +36,10 @@ public class PdfProcessingService {
     private final CacheService cacheService;
     private final QdrantVectorService qdrantVectorService;
     private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
+    private final KafkaEventProducerService kafkaEventProducerService;
 
     /**
-     * עיבוד קובץ PDF חדש לשיחה ספציפית עם תמיכה בקבצים מרובים
+     * עיבוד קובץ PDF חדש לשיחה ספציפית - גרסה אסינכרונית עם Kafka
      */
     public Document processPdfFile(MultipartFile file, ChatSession chatSession) throws IOException {
         validateFile(file);
@@ -46,7 +48,7 @@ public class PdfProcessingService {
         String originalFileName = file.getOriginalFilename();
         User sessionUser = chatSession.getUser();
 
-        log.info("מתחיל עיבוד קובץ PDF: {} עבור שיחה: {} של משתמש: {}",
+        log.info("מתחיל עיבוד אסינכרוני של קובץ PDF: {} עבור שיחה: {} של משתמש: {}",
                 originalFileName, chatSession.getId(), sessionUser.getUsername());
 
         // בדיקה אם קובץ עם אותו שם כבר קיים בשיחה הספציפית הזו
@@ -76,14 +78,14 @@ public class PdfProcessingService {
         document.setFileType(getFileExtension(originalFileName));
         document.setFileSize(file.getSize());
         document.setContentHash(contentHash);
-        document.setProcessingStatus(Document.ProcessingStatus.PROCESSING);
+        document.setProcessingStatus(Document.ProcessingStatus.PENDING); // סטטוס PENDING עד שיעובד
         document.setProcessingProgress(0);
 
         // קישור מפורש למשתמש ולשיחה הספציפית
         document.setUser(sessionUser);
         document.setChatSession(chatSession);
 
-        // עדכון: שימוש בcollection name מה-QdrantVectorService
+        // שימוש בcollection name מה-QdrantVectorService
         String sessionCollectionName = qdrantVectorService.generateSessionCollectionName(
                 chatSession.getId(), sessionUser.getId());
         document.setVectorCollectionName(sessionCollectionName);
@@ -92,45 +94,40 @@ public class PdfProcessingService {
         document = documentRepository.save(document);
 
         try {
-            // עיבוד הקובץ
-            dev.langchain4j.data.document.Document langchainDoc =
-                    createDocumentFromInputStream(file.getInputStream(), originalFileName,
-                            document.getId().toString(), sessionUser, chatSession);
+            // שמירת ה-ID במשתנה final לשימוש ב-lambda
+            final Long documentId = document.getId();
 
-            document.setCharacterCount(langchainDoc.text().length());
+            byte[] fileContent = file.getBytes();
 
-            // **עדכון מרכזי: שימוש ב-session-specific embedding store**
-            EmbeddingStore<TextSegment> sessionEmbeddingStore =
-                    qdrantVectorService.getEmbeddingStoreForSession(chatSession);
+            DocumentProcessingEvent event = DocumentProcessingEvent.forProcessing(
+                    documentId,  // שימוש במשתנה הlocal
+                    sessionUser.getId(),
+                    chatSession.getId(),
+                    originalFileName,
+                    getFileExtension(originalFileName),
+                    file.getSize(),
+                    contentHash,
+                    fileContent
+            );
 
-            // יצירת ingestor ספציפי לsession
-            EmbeddingStoreIngestor sessionIngestor =
-                    ingestorFactory.createIngestorForStore(sessionEmbeddingStore);
+            // שליחה אסינכרונית ל-Kafka
+            kafkaEventProducerService.sendDocumentProcessingEvent(event)
+                    .whenComplete((result, ex) -> {
+                        if (ex != null) {
+                            log.error("Failed to send processing event for document: {}", documentId, ex);
+                            updateDocumentStatusToFailed(documentId,
+                                    "Failed to queue for processing: " + ex.getMessage());
+                        } else {
+                            log.debug("Processing event sent successfully for document: {}", documentId);
+                        }
+                    });
 
-            // הכנסה ל-vector database עם collection נפרד לכל שיחה
-            sessionIngestor.ingest(langchainDoc);
+            log.info("קובץ {} הועבר לעיבוד אסינכרוני (מסמך ID: {})", originalFileName, documentId);
 
-            // עדכון סטטוס השלמה
-            document.setProcessingStatus(Document.ProcessingStatus.COMPLETED);
-            document.setProcessingProgress(100);
-            document.setProcessedAt(LocalDateTime.now());
-
-            // הערכת מספר chunks (בהנחה של 1200 תווים לchunk)
-            int estimatedChunks = (int) Math.ceil(langchainDoc.text().length() / 1200.0);
-            document.setChunkCount(estimatedChunks);
-
-            document = documentRepository.save(document);
-
-            // Invalidate caches after successful processing
-            invalidateSessionDocumentCache(chatSession.getId(), sessionUser.getId());
-
-            log.info("קובץ {} עובד בהצלחה עם {} תווים עבור שיחה {} של משתמש {} (מסמך ID: {}, Collection: {})",
-                    originalFileName, langchainDoc.text().length(), chatSession.getId(),
-                    sessionUser.getUsername(), document.getId(), sessionCollectionName);
             return document;
 
         } catch (Exception e) {
-            log.error("שגיאה בעיבוד קובץ PDF: {} עבור שיחה {} של משתמש {}",
+            log.error("שגיאה בהעברת קובץ PDF לעיבוד אסינכרוני: {} עבור שיחה {} של משתמש {}",
                     originalFileName, chatSession.getId(), sessionUser.getUsername(), e);
 
             // עדכון סטטוס שגיאה
@@ -139,7 +136,26 @@ public class PdfProcessingService {
             document.setErrorMessage(e.getMessage());
             documentRepository.save(document);
 
-            throw new IOException("לא ניתן לעבד את קובץ ה-PDF: " + e.getMessage(), e);
+            throw new IOException("לא ניתן להעביר את הקובץ לעיבוד: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * עדכון מסמך לסטטוס failed (helper method)
+     */
+    private void updateDocumentStatusToFailed(Long documentId, String errorMessage) {
+        try {
+            Optional<Document> docOpt = documentRepository.findById(documentId);
+            if (docOpt.isPresent()) {
+                Document doc = docOpt.get();
+                doc.setProcessingStatus(Document.ProcessingStatus.FAILED);
+                doc.setProcessingProgress(0);
+                doc.setErrorMessage(errorMessage);
+                documentRepository.save(doc);
+                log.error("Document {} status updated to FAILED: {}", documentId, errorMessage);
+            }
+        } catch (Exception e) {
+            log.error("Failed to update document {} to FAILED status", documentId, e);
         }
     }
 
