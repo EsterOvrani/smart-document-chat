@@ -37,6 +37,7 @@ public class DocumentProcessingConsumer {
     private final KafkaEventProducerService kafkaEventProducerService;
     private final CacheService cacheService;
     private final DocumentProgressTrackingService progressTrackingService;
+    private final DocumentProcessingErrorHandler errorHandler;
 
     @KafkaListener(
             topics = KafkaConfig.DOCUMENT_PROCESSING_TOPIC,
@@ -85,16 +86,10 @@ public class DocumentProcessingConsumer {
             log.error("Failed to process document event: documentId={}, correlationId={}, error={}",
                     event.getDocumentId(), correlationId, e.getMessage(), e);
 
-            // שליחת סטטוס "נכשל"
-            kafkaEventProducerService.sendFailedStatus(
-                    event.getDocumentId(), event.getUserId(), event.getSessionId(),
-                    correlationId, e.getMessage(), getErrorDetails(e));
+            // שימוש ב-error handler לטיפול בשגיאה
+            errorHandler.handleProcessingError(event, e, correlationId);
 
-            // עדכון מסמך בDB לסטטוס failed
-            updateDocumentStatus(event.getDocumentId(), Document.ProcessingStatus.FAILED,
-                    0, e.getMessage());
-
-            // אישור הודעה גם במקרה של שגיאה (אחרת תישאר בתור לנצח)
+            // אישור הודעה
             acknowledgment.acknowledge();
         }
     }
