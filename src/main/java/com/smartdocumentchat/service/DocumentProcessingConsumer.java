@@ -36,6 +36,7 @@ public class DocumentProcessingConsumer {
     private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
     private final KafkaEventProducerService kafkaEventProducerService;
     private final CacheService cacheService;
+    private final DocumentProgressTrackingService progressTrackingService;
 
     @KafkaListener(
             topics = KafkaConfig.DOCUMENT_PROCESSING_TOPIC,
@@ -57,6 +58,9 @@ public class DocumentProcessingConsumer {
                 event.getAction(), correlationId, partition, offset);
 
         try {
+            // התחלת מעקב progress
+            progressTrackingService.startTracking(event.getDocumentId(), event.getUserId(), event.getSessionId());
+
             // שליחת סטטוס "התקבל"
             kafkaEventProducerService.sendReceivedStatus(
                     event.getDocumentId(), event.getUserId(), event.getSessionId(), correlationId);
