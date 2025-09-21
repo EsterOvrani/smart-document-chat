@@ -917,6 +917,206 @@ public class ChatSessionController {
         }
     }
 
+    /**
+     * עדכון מטאדטה של מסמך בשיחה
+     */
+    @PutMapping("/{sessionId}/documents/{documentId}")
+    public ResponseEntity<?> updateDocumentMetadata(
+            @PathVariable Long sessionId,
+            @PathVariable Long documentId,
+            @RequestBody DocumentUpdateRequest request,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+
+            // בדיקת הרשאות לשיחה
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            if (!isUserAuthorizedForSession(currentUser, sessionOpt.get())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת המסמך ועדכונו
+            Optional<Document> documentOpt = pdfProcessingService.getDocumentById(documentId, currentUser);
+            if (documentOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "מסמך לא נמצא"
+                ));
+            }
+
+            Document document = documentOpt.get();
+
+            // וידוא שהמסמך שייך לשיחה
+            if (!document.getChatSession().getId().equals(sessionId)) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "מסמך לא שייך לשיחה זו"
+                ));
+            }
+
+            // עדכון שדות לפי הבקשה
+            boolean updated = false;
+            if (request.getDisplayName() != null && !request.getDisplayName().trim().isEmpty()) {
+                document.setOriginalFileName(request.getDisplayName().trim());
+                updated = true;
+            }
+
+            if (updated) {
+                pdfProcessingService.updateDocument(document);
+                invalidateSessionCache(sessionId, currentUser.getId());
+
+                return ResponseEntity.ok(Map.of(
+                        "success", true,
+                        "message", "מטאדטה של המסמך עודכנה בהצלחה",
+                        "document", buildDocumentSummary(document)
+                ));
+            } else {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "לא בוצעו שינויים"
+                ));
+            }
+
+        } catch (Exception e) {
+            log.error("שגיאה בעדכון מטאדטה של מסמך {} בשיחה {}", documentId, sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בעדכון המסמך"
+            ));
+        }
+    }
+
+    /**
+     * קבלת מסמכים עם סינון ומיון
+     */
+    @GetMapping("/{sessionId}/documents/search")
+    public ResponseEntity<?> searchSessionDocuments(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "query", required = false) String searchQuery,
+            @RequestParam(value = "fileType", required = false) String fileType,
+            @RequestParam(value = "status", required = false) String status,
+            @RequestParam(value = "sortBy", defaultValue = "uploadTime") String sortBy,
+            @RequestParam(value = "sortOrder", defaultValue = "desc") String sortOrder,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            ChatSession session = sessionOpt.get();
+
+            if (!isUserAuthorizedForSession(currentUser, session)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת כל המסמכים
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
+
+            // סינון לפי חיפוש
+            if (searchQuery != null && !searchQuery.trim().isEmpty()) {
+                String query = searchQuery.toLowerCase();
+                documents = documents.stream()
+                        .filter(doc -> doc.getOriginalFileName().toLowerCase().contains(query))
+                        .collect(Collectors.toList());
+            }
+
+            // סינון לפי סוג קובץ
+            if (fileType != null && !fileType.trim().isEmpty()) {
+                documents = documents.stream()
+                        .filter(doc -> fileType.equalsIgnoreCase(doc.getFileType()))
+                        .collect(Collectors.toList());
+            }
+
+            // סינון לפי סטטוס
+            if (status != null && !status.trim().isEmpty()) {
+                Document.ProcessingStatus filterStatus = Document.ProcessingStatus.valueOf(status.toUpperCase());
+                documents = documents.stream()
+                        .filter(doc -> doc.getProcessingStatus() == filterStatus)
+                        .collect(Collectors.toList());
+            }
+
+            // מיון
+            documents = sortDocuments(documents, sortBy, sortOrder);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "sessionId", sessionId,
+                    "documents", documents.stream().map(this::buildDocumentSummary).toList(),
+                    "totalResults", documents.size(),
+                    "filters", Map.of(
+                            "query", searchQuery != null ? searchQuery : "",
+                            "fileType", fileType != null ? fileType : "",
+                            "status", status != null ? status : "",
+                            "sortBy", sortBy,
+                            "sortOrder", sortOrder
+                    )
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בחיפוש מסמכים בשיחה: {}", sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בחיפוש המסמכים"
+            ));
+        }
+    }
+
+    // Helper method למיון מסמכים
+    private List<Document> sortDocuments(List<Document> documents, String sortBy, String sortOrder) {
+        Comparator<Document> comparator;
+
+        switch (sortBy.toLowerCase()) {
+            case "name":
+                comparator = Comparator.comparing(Document::getOriginalFileName);
+                break;
+            case "size":
+                comparator = Comparator.comparing(Document::getFileSize);
+                break;
+            case "status":
+                comparator = Comparator.comparing(Document::getProcessingStatus);
+                break;
+            case "uploadtime":
+            default:
+                comparator = Comparator.comparing(Document::getCreatedAt);
+                break;
+        }
+
+        if ("desc".equalsIgnoreCase(sortOrder)) {
+            comparator = comparator.reversed();
+        }
+
+        return documents.stream().sorted(comparator).collect(Collectors.toList());
+    }
+
+    // Request DTO לעדכון מסמך
+    public static class DocumentUpdateRequest {
+        private String displayName;
+
+        public DocumentUpdateRequest() {}
+
+        public String getDisplayName() { return displayName; }
+        public void setDisplayName(String displayName) { this.displayName = displayName; }
+    }
+
     // DTO חדש לחיפוש מתקדם
     public static class AdvancedSearchRequest {
         private String query;
