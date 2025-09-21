@@ -38,6 +38,8 @@ public class DocumentProcessingConsumer {
     private final CacheService cacheService;
     private final DocumentProgressTrackingService progressTrackingService;
     private final DocumentProcessingErrorHandler errorHandler;
+    private final FileStorageService fileStorageService;
+
 
     @KafkaListener(
             topics = KafkaConfig.DOCUMENT_PROCESSING_TOPIC,
@@ -228,8 +230,8 @@ public class DocumentProcessingConsumer {
 
         ApachePdfBoxDocumentParser parser = new ApachePdfBoxDocumentParser();
 
-        try (ByteArrayInputStream inputStream = new ByteArrayInputStream(fileContent)) {
-            dev.langchain4j.data.document.Document document = parser.parse(inputStream);
+        try (ByteArrayInputStream byteStream = new ByteArrayInputStream(fileContent)) {
+            dev.langchain4j.data.document.Document document = parser.parse(byteStream);
 
             if (document.text() == null || document.text().trim().isEmpty()) {
                 throw new Exception("Document parsed but contains no text");
