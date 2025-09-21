@@ -21,9 +21,8 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.time.LocalDateTime;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @RestController
@@ -221,6 +220,20 @@ public class ChatSessionController {
 
             // בדיקה שיש מסמכים בשיחה
             List<Document> documents = pdfProcessingService.getDocumentsBySession(chatSession);
+
+            // שמירת מספר המסמכים המקורי
+            int totalAvailableDocuments = documents.size();
+
+            // **זה החלק החדש - סינון מסמכים לפי IDs אם צוין**
+            if (request.getDocumentIds() != null && !request.getDocumentIds().isEmpty()) {
+                documents = documents.stream()
+                        .filter(doc -> request.getDocumentIds().contains(doc.getId()))
+                        .collect(Collectors.toList());
+
+                log.info("Filtered to {} documents from {} by IDs",
+                        documents.size(), totalAvailableDocuments);
+            }
+
             if (documents.isEmpty()) {
                 return ResponseEntity.badRequest().body(Map.of(
                         "success", false,
@@ -281,18 +294,25 @@ public class ChatSessionController {
                     cacheHit ? "HIT" : "MISS",
                     qdrantVectorService.generateSessionCollectionName(sessionId, currentUser.getId()));
 
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "answer", answer,
-                    "originalQuestion", request.getText(),
-                    "sessionId", chatSession.getId(),
-                    "userId", currentUser.getId(),
-                    "documentsCount", documents.size(),
-                    "processingTime", processingTime,
-                    "cacheHit", cacheHit,
-                    "questionHash", questionHash,
-                    "collectionName", qdrantVectorService.generateSessionCollectionName(sessionId, currentUser.getId())
-            ));
+            return ResponseEntity.ok(
+                    Map.ofEntries(
+                            Map.entry("success", true),
+                            Map.entry("answer", answer),
+                            Map.entry("originalQuestion", request.getText()),
+                            Map.entry("sessionId", chatSession.getId()),
+                            Map.entry("userId", currentUser.getId()),
+                            Map.entry("documentsCount", documents.size()),
+                            Map.entry("totalAvailableDocuments", totalAvailableDocuments), // חדש
+                            Map.entry("documentFiltering", Map.ofEntries(
+                                    Map.entry("appliedFilters", request.getDocumentIds() != null && !request.getDocumentIds().isEmpty()),
+                                    Map.entry("selectedDocumentIds", request.getDocumentIds() != null ? request.getDocumentIds() : List.of())
+                            )),
+                            Map.entry("processingTime", processingTime),
+                            Map.entry("cacheHit", cacheHit),
+                            Map.entry("questionHash", questionHash),
+                            Map.entry("collectionName", qdrantVectorService.generateSessionCollectionName(sessionId, currentUser.getId()))
+                    )
+            );
 
         } catch (SecurityException e) {
             log.warn("שגיאת הרשאות בשיחה: {}", e.getMessage());
@@ -711,25 +731,44 @@ public class ChatSessionController {
     private String enhanceQuestionForSession(String originalQuestion, List<Document> documents,
                                              User user, ChatSession chatSession) {
         StringBuilder documentsList = new StringBuilder();
-        for (Document doc : documents) {
-            documentsList.append("- ").append(doc.getOriginalFileName()).append("\n");
+
+        // הוסף מידע מפורט על כל מסמך
+        for (int i = 0; i < documents.size(); i++) {
+            Document doc = documents.get(i);
+            documentsList.append(String.format("%d. %s (ID: %d, סוג: %s, גודל: %s, %d תווים)\n",
+                    i + 1,
+                    doc.getOriginalFileName(),
+                    doc.getId(),
+                    doc.getFileType() != null ? doc.getFileType() : "unknown",
+                    doc.getFileSizeFormatted(),
+                    doc.getCharacterCount() != null ? doc.getCharacterCount() : 0));
         }
 
         String enhancedQuestion = String.format(
-                "בהקשר של השיחה '%s' עם המסמכים הבאים שהועלו על ידי %s:\n%s\nענה על השאלה: %s\n\n" +
-                        "חשוב: ענה רק על בסיס המידע שמופיע במסמכים האלה בלבד, במסגרת השיחה הזו.",
+                "בהקשר של השיחה '%s' עם %d מסמכים:\n%s\n" +
+                        "ענה על השאלה: %s\n\n" +
+                        "חשוב:\n" +
+                        "1. ענה רק על בסיס המידע שמופיע במסמכים האלה\n" +
+                        "2. אם מידע מופיע במספר מסמכים - השווה ביניהם והזכר הבדלים\n" +
+                        "3. ציין מאיזה מסמך (לפי שמו או מספרו) לקחת כל חלק מהמידע\n" +
+                        "4. אם המידע לא מופיע במסמכים - ציין זאת במפורש",
                 chatSession.getDisplayTitle(),
-                user.getFullName() != null ? user.getFullName() : user.getUsername(),
+                documents.size(),
                 documentsList.toString(),
                 originalQuestion
         );
 
-        // שיפורים ספציפיים לסוגי שאלות נפוצות
+        // שיפורים ספציפיים לסוגי שאלות
         String lowerQuestion = originalQuestion.toLowerCase();
-        if (lowerQuestion.contains("השווה") || lowerQuestion.contains("compare")) {
-            enhancedQuestion += "\n\nהשווה מידע בין המסמכים השונים בשיחה הזו.";
-        } else if (lowerQuestion.contains("סיכום") || lowerQuestion.contains("summary")) {
-            enhancedQuestion += "\n\nצור סיכום מקיף על בסיס כל המסמכים בשיחה הזו.";
+        if (lowerQuestion.contains("השווה") || lowerQuestion.contains("compare") ||
+                lowerQuestion.contains("הבדל")) {
+            enhancedQuestion += "\n\nהשווה את המידע בין המסמכים השונים והצג הבדלים ודמיון.";
+        } else if (lowerQuestion.contains("סיכום") || lowerQuestion.contains("summary") ||
+                lowerQuestion.contains("תמצית")) {
+            enhancedQuestion += "\n\nצור סיכום מקיף המשלב מידע מכל המסמכים.";
+        } else if (lowerQuestion.contains("מצא") || lowerQuestion.contains("find") ||
+                lowerQuestion.contains("חפש")) {
+            enhancedQuestion += "\n\nחפש במסמכים וציין בדיוק באילו מסמכים נמצא המידע.";
         }
 
         return enhancedQuestion;
@@ -742,9 +781,547 @@ public class ChatSessionController {
         log.debug("Invalidating cache for session: {} and user: {}", sessionId, userId);
     }
 
+    /**
+     * חיפוש מתקדם עם filtering מרובה
+     */
+    @PostMapping("/{sessionId}/advanced-search")
+    public ResponseEntity<?> advancedSearch(
+            @PathVariable Long sessionId,
+            @RequestBody AdvancedSearchRequest request,
+            @RequestParam(value = "userId", required = false) Long userId) {
+
+        long startTime = System.currentTimeMillis();
+
+        try {
+            User currentUser = getCurrentUser(userId);
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            ChatSession chatSession = sessionOpt.get();
+
+            if (!isUserAuthorizedForSession(currentUser, chatSession)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת כל המסמכים
+            List<Document> allDocuments = pdfProcessingService.getDocumentsBySession(chatSession);
+            List<Document> filteredDocuments = new ArrayList<>(allDocuments);
+
+            Map<String, Object> filteringInfo = new HashMap<>();
+            filteringInfo.put("totalDocuments", allDocuments.size());
+
+            // סינון לפי document IDs
+            if (request.getDocumentIds() != null && !request.getDocumentIds().isEmpty()) {
+                Set<Long> requestedIds = new HashSet<>(request.getDocumentIds());
+                filteredDocuments = filteredDocuments.stream()
+                        .filter(doc -> requestedIds.contains(doc.getId()))
+                        .collect(Collectors.toList());
+                filteringInfo.put("documentIdFilter", request.getDocumentIds());
+            }
+
+            // סינון לפי סוג קובץ
+            if (request.getFileTypes() != null && !request.getFileTypes().isEmpty()) {
+                filteredDocuments = filteredDocuments.stream()
+                        .filter(doc -> request.getFileTypes().contains(doc.getFileType()))
+                        .collect(Collectors.toList());
+                filteringInfo.put("fileTypeFilter", request.getFileTypes());
+            }
+
+            // סינון לפי גודל קובץ
+            if (request.getMinFileSize() != null) {
+                filteredDocuments = filteredDocuments.stream()
+                        .filter(doc -> doc.getFileSize() >= request.getMinFileSize())
+                        .collect(Collectors.toList());
+                filteringInfo.put("minFileSize", request.getMinFileSize());
+            }
+
+            if (request.getMaxFileSize() != null) {
+                filteredDocuments = filteredDocuments.stream()
+                        .filter(doc -> doc.getFileSize() <= request.getMaxFileSize())
+                        .collect(Collectors.toList());
+                filteringInfo.put("maxFileSize", request.getMaxFileSize());
+            }
+
+            // סינון לפי תאריך העלאה
+            if (request.getUploadedAfter() != null) {
+                filteredDocuments = filteredDocuments.stream()
+                        .filter(doc -> doc.getCreatedAt().isAfter(request.getUploadedAfter()))
+                        .collect(Collectors.toList());
+                filteringInfo.put("uploadedAfter", request.getUploadedAfter());
+            }
+
+            filteringInfo.put("filteredDocuments", filteredDocuments.size());
+
+            if (filteredDocuments.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "לא נמצאו מסמכים תואמים לקריטריונים",
+                        "filteringInfo", filteringInfo
+                ));
+            }
+
+            // ביצוע החיפוש
+            String enhancedQuestion = enhanceQuestionForSession(
+                    request.getQuery(), filteredDocuments, currentUser, chatSession);
+
+            EmbeddingStore<TextSegment> sessionEmbeddingStore =
+                    qdrantVectorService.getEmbeddingStoreForSession(chatSession);
+
+            ConversationalRetrievalChain sessionChain =
+                    ingestorFactory.createChainForStore(sessionEmbeddingStore);
+
+            String answer = sessionChain.execute(enhancedQuestion);
+
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "answer", answer,
+                    "query", request.getQuery(),
+                    "searchedDocuments", filteredDocuments.stream()
+                            .map(this::buildDocumentSummary)
+                            .collect(Collectors.toList()),
+                    "filteringInfo", filteringInfo,
+                    "processingTime", processingTime,
+                    "sessionId", chatSession.getId()
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בחיפוש מתקדם", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בחיפוש: " + e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * עדכון מטאדטה של מסמך בשיחה
+     */
+    @PutMapping("/{sessionId}/documents/{documentId}")
+    public ResponseEntity<?> updateDocumentMetadata(
+            @PathVariable Long sessionId,
+            @PathVariable Long documentId,
+            @RequestBody DocumentUpdateRequest request,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+
+            // בדיקת הרשאות לשיחה
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            if (!isUserAuthorizedForSession(currentUser, sessionOpt.get())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת המסמך ועדכונו
+            Optional<Document> documentOpt = pdfProcessingService.getDocumentById(documentId, currentUser);
+            if (documentOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "מסמך לא נמצא"
+                ));
+            }
+
+            Document document = documentOpt.get();
+
+            // וידוא שהמסמך שייך לשיחה
+            if (!document.getChatSession().getId().equals(sessionId)) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "מסמך לא שייך לשיחה זו"
+                ));
+            }
+
+            // עדכון שדות לפי הבקשה
+            boolean updated = false;
+            if (request.getDisplayName() != null && !request.getDisplayName().trim().isEmpty()) {
+                document.setOriginalFileName(request.getDisplayName().trim());
+                updated = true;
+            }
+
+            if (updated) {
+                pdfProcessingService.updateDocument(document);
+                invalidateSessionCache(sessionId, currentUser.getId());
+
+                return ResponseEntity.ok(Map.of(
+                        "success", true,
+                        "message", "מטאדטה של המסמך עודכנה בהצלחה",
+                        "document", buildDocumentSummary(document)
+                ));
+            } else {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "לא בוצעו שינויים"
+                ));
+            }
+
+        } catch (Exception e) {
+            log.error("שגיאה בעדכון מטאדטה של מסמך {} בשיחה {}", documentId, sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בעדכון המסמך"
+            ));
+        }
+    }
+
+    /**
+     * קבלת מסמכים עם סינון ומיון
+     */
+    @GetMapping("/{sessionId}/documents/search")
+    public ResponseEntity<?> searchSessionDocuments(
+            @PathVariable Long sessionId,
+            @RequestParam(value = "query", required = false) String searchQuery,
+            @RequestParam(value = "fileType", required = false) String fileType,
+            @RequestParam(value = "status", required = false) String status,
+            @RequestParam(value = "sortBy", defaultValue = "uploadTime") String sortBy,
+            @RequestParam(value = "sortOrder", defaultValue = "desc") String sortOrder,
+            @RequestParam(value = "userId", required = false) Long userId) {
+        try {
+            User currentUser = getCurrentUser(userId);
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            ChatSession session = sessionOpt.get();
+
+            if (!isUserAuthorizedForSession(currentUser, session)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת כל המסמכים
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
+
+            // סינון לפי חיפוש
+            if (searchQuery != null && !searchQuery.trim().isEmpty()) {
+                String query = searchQuery.toLowerCase();
+                documents = documents.stream()
+                        .filter(doc -> doc.getOriginalFileName().toLowerCase().contains(query))
+                        .collect(Collectors.toList());
+            }
+
+            // סינון לפי סוג קובץ
+            if (fileType != null && !fileType.trim().isEmpty()) {
+                documents = documents.stream()
+                        .filter(doc -> fileType.equalsIgnoreCase(doc.getFileType()))
+                        .collect(Collectors.toList());
+            }
+
+            // סינון לפי סטטוס
+            if (status != null && !status.trim().isEmpty()) {
+                Document.ProcessingStatus filterStatus = Document.ProcessingStatus.valueOf(status.toUpperCase());
+                documents = documents.stream()
+                        .filter(doc -> doc.getProcessingStatus() == filterStatus)
+                        .collect(Collectors.toList());
+            }
+
+            // מיון
+            documents = sortDocuments(documents, sortBy, sortOrder);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "sessionId", sessionId,
+                    "documents", documents.stream().map(this::buildDocumentSummary).toList(),
+                    "totalResults", documents.size(),
+                    "filters", Map.of(
+                            "query", searchQuery != null ? searchQuery : "",
+                            "fileType", fileType != null ? fileType : "",
+                            "status", status != null ? status : "",
+                            "sortBy", sortBy,
+                            "sortOrder", sortOrder
+                    )
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בחיפוש מסמכים בשיחה: {}", sessionId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בחיפוש המסמכים"
+            ));
+        }
+    }
+
+    /**
+     * חיפוש בתוך מסמך ספציפי או קבוצת מסמכים
+     */
+    @PostMapping("/{sessionId}/search")
+    public ResponseEntity<?> searchInDocuments(
+            @PathVariable Long sessionId,
+            @RequestBody DocumentSearchRequest request,
+            @RequestParam(value = "userId", required = false) Long userId) {
+
+        long startTime = System.currentTimeMillis();
+
+        try {
+            User currentUser = getCurrentUser(userId);
+
+            if (request.getQuery() == null || request.getQuery().trim().isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שאלת החיפוש לא יכולה להיות ריקה"
+                ));
+            }
+
+            Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
+            if (sessionOpt.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא נמצאה"
+                ));
+            }
+
+            ChatSession chatSession = sessionOpt.get();
+
+            if (!isUserAuthorizedForSession(currentUser, chatSession)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשיחה זו"
+                ));
+            }
+
+            // קבלת מסמכים לחיפוש
+            List<Document> documents = pdfProcessingService.getDocumentsBySession(chatSession);
+
+            // סינון לפי מסמכים ספציפיים אם צוין
+            if (request.getDocumentIds() != null && !request.getDocumentIds().isEmpty()) {
+                Set<Long> requestedIds = new HashSet<>(request.getDocumentIds());
+                documents = documents.stream()
+                        .filter(doc -> requestedIds.contains(doc.getId()))
+                        .collect(Collectors.toList());
+
+                log.info("מחפש במסמכים ספציפיים: {} מתוך {}",
+                        documents.size(), requestedIds.size());
+            }
+
+            if (documents.isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "לא נמצאו מסמכים לחיפוש"
+                ));
+            }
+
+            // בניית שאלה משופרת עבור מסמכים ספציפיים
+            String enhancedQuery = buildEnhancedSearchQuery(
+                    request.getQuery(),
+                    documents,
+                    chatSession,
+                    request.getSearchMode()
+            );
+
+            // קבלת embedding store ספציפי לשיחה
+            EmbeddingStore<TextSegment> sessionEmbeddingStore =
+                    qdrantVectorService.getEmbeddingStoreForSession(chatSession);
+
+            // יצירת retrieval chain ספציפי לשיחה
+            ConversationalRetrievalChain sessionChain =
+                    ingestorFactory.createChainForStore(sessionEmbeddingStore);
+
+            // ביצוע החיפוש
+            String answer = sessionChain.execute(enhancedQuery);
+
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            log.info("חיפוש בוצע בהצלחה: {} מסמכים, {} ms",
+                    documents.size(), processingTime);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "answer", answer,
+                    "query", request.getQuery(),
+                    "searchedDocuments", documents.stream()
+                            .map(this::buildDocumentSummary)
+                            .collect(Collectors.toList()),
+                    "documentCount", documents.size(),
+                    "searchMode", request.getSearchMode() != null ?
+                            request.getSearchMode() : "semantic",
+                    "processingTime", processingTime,
+                    "sessionId", sessionId
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בחיפוש במסמכים", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בביצוע החיפוש: " + e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * בניית שאלה משופרת לחיפוש במסמכים ספציפיים
+     */
+    private String buildEnhancedSearchQuery(String originalQuery, List<Document> documents,
+                                            ChatSession chatSession, String searchMode) {
+        StringBuilder query = new StringBuilder();
+
+        // כותרת
+        query.append("חפש במסמכים הבאים");
+
+        if (documents.size() == 1) {
+            query.append(" במסמך: ").append(documents.get(0).getOriginalFileName());
+        } else {
+            query.append(" ב-").append(documents.size()).append(" מסמכים:\n");
+            for (int i = 0; i < Math.min(documents.size(), 5); i++) {
+                query.append((i + 1)).append(". ")
+                        .append(documents.get(i).getOriginalFileName()).append("\n");
+            }
+            if (documents.size() > 5) {
+                query.append("ועוד ").append(documents.size() - 5).append(" מסמכים...\n");
+            }
+        }
+
+        query.append("\n");
+
+        // הוראות חיפוש לפי מצב
+        if ("exact".equals(searchMode)) {
+            query.append("חפש התאמה מדויקת לטקסט: \"").append(originalQuery).append("\"\n");
+            query.append("החזר את הקטעים המדויקים שמכילים את הטקסט הזה.\n");
+        } else if ("keyword".equals(searchMode)) {
+            query.append("חפש מילות מפתח: ").append(originalQuery).append("\n");
+            query.append("מצא קטעים שמכילים את מילות המפתח האלה.\n");
+        } else { // semantic - ברירת מחדל
+            query.append("שאלה: ").append(originalQuery).append("\n");
+            query.append("ענה על בסיס ההקשר והמשמעות של השאלה.\n");
+        }
+
+        query.append("\nחשוב:\n");
+        query.append("1. ציין מאיזה מסמך לקחת כל מידע (בשם המסמך)\n");
+        query.append("2. אם המידע לא קיים במסמכים - ציין זאת במפורש\n");
+        query.append("3. אם יש מידע דומה במספר מסמכים - ציין את ההבדלים\n");
+
+        return query.toString();
+    }
+
+
+    // Helper method למיון מסמכים
+    private List<Document> sortDocuments(List<Document> documents, String sortBy, String sortOrder) {
+        Comparator<Document> comparator;
+
+        switch (sortBy.toLowerCase()) {
+            case "name":
+                comparator = Comparator.comparing(Document::getOriginalFileName);
+                break;
+            case "size":
+                comparator = Comparator.comparing(Document::getFileSize);
+                break;
+            case "status":
+                comparator = Comparator.comparing(Document::getProcessingStatus);
+                break;
+            case "uploadtime":
+            default:
+                comparator = Comparator.comparing(Document::getCreatedAt);
+                break;
+        }
+
+        if ("desc".equalsIgnoreCase(sortOrder)) {
+            comparator = comparator.reversed();
+        }
+
+        return documents.stream().sorted(comparator).collect(Collectors.toList());
+    }
+
+    // Request DTO לחיפוש במסמכים
+    public static class DocumentSearchRequest {
+        private String query;
+        private List<Long> documentIds;  // מסמכים ספציפיים לחיפוש
+        private String searchMode;        // "semantic", "keyword", "exact"
+        private Integer maxResults;
+
+        public DocumentSearchRequest() {}
+
+        public String getQuery() { return query; }
+        public void setQuery(String query) { this.query = query; }
+
+        public List<Long> getDocumentIds() { return documentIds; }
+        public void setDocumentIds(List<Long> documentIds) { this.documentIds = documentIds; }
+
+        public String getSearchMode() { return searchMode; }
+        public void setSearchMode(String searchMode) { this.searchMode = searchMode; }
+
+        public Integer getMaxResults() { return maxResults; }
+        public void setMaxResults(Integer maxResults) { this.maxResults = maxResults; }
+    }
+
+    // Request DTO לעדכון מסמך
+    public static class DocumentUpdateRequest {
+        private String displayName;
+
+        public DocumentUpdateRequest() {}
+
+        public String getDisplayName() { return displayName; }
+        public void setDisplayName(String displayName) { this.displayName = displayName; }
+    }
+
+    // DTO חדש לחיפוש מתקדם
+    public static class AdvancedSearchRequest {
+        private String query;
+        private List<Long> documentIds;
+        private List<String> fileTypes;
+        private Long minFileSize;
+        private Long maxFileSize;
+        private LocalDateTime uploadedAfter;
+        private Double minRelevanceScore;
+        private Integer maxResults;
+
+        public AdvancedSearchRequest() {}
+
+        // Getters and Setters
+        public String getQuery() { return query; }
+        public void setQuery(String query) { this.query = query; }
+
+        public List<Long> getDocumentIds() { return documentIds; }
+        public void setDocumentIds(List<Long> documentIds) { this.documentIds = documentIds; }
+
+        public List<String> getFileTypes() { return fileTypes; }
+        public void setFileTypes(List<String> fileTypes) { this.fileTypes = fileTypes; }
+
+        public Long getMinFileSize() { return minFileSize; }
+        public void setMinFileSize(Long minFileSize) { this.minFileSize = minFileSize; }
+
+        public Long getMaxFileSize() { return maxFileSize; }
+        public void setMaxFileSize(Long maxFileSize) { this.maxFileSize = maxFileSize; }
+
+        public LocalDateTime getUploadedAfter() { return uploadedAfter; }
+        public void setUploadedAfter(LocalDateTime uploadedAfter) { this.uploadedAfter = uploadedAfter; }
+
+        public Double getMinRelevanceScore() { return minRelevanceScore; }
+        public void setMinRelevanceScore(Double minRelevanceScore) { this.minRelevanceScore = minRelevanceScore; }
+
+        public Integer getMaxResults() { return maxResults; }
+        public void setMaxResults(Integer maxResults) { this.maxResults = maxResults; }
+    }
+
     // Request DTO
     public static class ChatRequest {
         private String text;
+        private List<Long> documentIds;        // חדש - לבחירת מסמכים ספציפיים
+        private String searchMode;             // חדש - סוג החיפוש
 
         public ChatRequest() {}
 
@@ -752,12 +1329,13 @@ public class ChatSessionController {
             this.text = text;
         }
 
-        public String getText() {
-            return text;
-        }
+        public String getText() { return text; }
+        public void setText(String text) { this.text = text; }
 
-        public void setText(String text) {
-            this.text = text;
-        }
+        public List<Long> getDocumentIds() { return documentIds; }
+        public void setDocumentIds(List<Long> documentIds) { this.documentIds = documentIds; }
+
+        public String getSearchMode() { return searchMode; }
+        public void setSearchMode(String searchMode) { this.searchMode = searchMode; }
     }
 }

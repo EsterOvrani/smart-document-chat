@@ -10,6 +10,7 @@ import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentPa
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
+import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -504,6 +505,24 @@ public class PdfProcessingService {
         cacheService.delete("user_all_docs:" + userId);
         cacheService.delete("user_stats:" + userId);
         log.debug("Invalidated user documents cache for user {}", userId);
+    }
+
+    /**
+     * עדכון מסמך קיים
+     */
+    @Transactional
+    public Document updateDocument(Document document) {
+        Document updated = documentRepository.save(document);
+
+        // עדכון cache
+        String cacheKey = "document:" + document.getId() + "_user:" + document.getUser().getId();
+        cacheService.cacheDocumentMetadata(cacheKey, updated);
+
+        // ניקוי cache של השיחה
+        invalidateSessionDocumentCache(document.getChatSession().getId(), document.getUser().getId());
+
+        log.info("מסמך {} עודכן בהצלחה", document.getId());
+        return updated;
     }
 
     // Inner classes for statistics
