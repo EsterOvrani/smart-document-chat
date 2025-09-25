@@ -37,9 +37,10 @@ public class PdfProcessingService {
     private final QdrantVectorService qdrantVectorService;
     private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
     private final KafkaEventProducerService kafkaEventProducerService;
+    private final FileStorageService fileStorageService; // הוסף זאת
 
     /**
-     * עיבוד קובץ PDF חדש לשיחה ספציפית - גרסה אסינכרונית עם Kafka
+     * עיבוד קובץ PDF חדש לשיחה ספציפית - גרסה אסינכרונית עם Kafka ואחסון ב-MinIO
      */
     public Document processPdfFile(MultipartFile file, ChatSession chatSession) throws IOException {
         validateFile(file);
@@ -61,8 +62,9 @@ public class PdfProcessingService {
             throw new IllegalArgumentException("קובץ עם שם זהה כבר קיים בשיחה זו");
         }
 
-        // חישוב hash של התוכן - בודק רק בתוך אותה שיחה
-        String contentHash = calculateFileHash(file.getBytes());
+        // חישוב hash של התוכן
+        byte[] fileContent = file.getBytes();
+        String contentHash = calculateFileHash(fileContent);
         Optional<Document> duplicateDoc = findDuplicateInSession(chatSession, contentHash);
 
         if (duplicateDoc.isPresent()) {
@@ -71,14 +73,29 @@ public class PdfProcessingService {
             throw new IllegalArgumentException("קובץ עם תוכן זהה כבר קיים בשיחה זו");
         }
 
-        // יצירת רשומת Document חדשה עם קישור לשיחה ספציפית
+        // יצירת שם קובץ ייחודי
+        String uniqueFileName = generateUniqueFileName(originalFileName, sessionUser.getId(), chatSession.getId());
+
+        // שמירת הקובץ ב-MinIO
+        String storagePath = generateStoragePath(sessionUser.getId(), chatSession.getId(), uniqueFileName);
+
+        try {
+            fileStorageService.uploadFile(new ByteArrayInputStream(fileContent), storagePath,
+                    file.getContentType(), file.getSize());
+            log.info("קובץ נשמר בהצלחה ב-MinIO: {}", storagePath);
+        } catch (Exception e) {
+            log.error("שגיאה בשמירת קובץ ב-MinIO: {}", storagePath, e);
+            throw new IOException("Failed to store file in MinIO", e);
+        }
+
+        // יצירת רשומת Document חדשה
         Document document = new Document();
-        document.setFileName(generateUniqueFileName(originalFileName, sessionUser.getId(), chatSession.getId()));
+        document.setFileName(storagePath); // שמירת הנתיב המלא ב-MinIO
         document.setOriginalFileName(originalFileName);
         document.setFileType(getFileExtension(originalFileName));
         document.setFileSize(file.getSize());
         document.setContentHash(contentHash);
-        document.setProcessingStatus(Document.ProcessingStatus.PENDING); // סטטוס PENDING עד שיעובד
+        document.setProcessingStatus(Document.ProcessingStatus.PENDING);
         document.setProcessingProgress(0);
 
         // קישור מפורש למשתמש ולשיחה הספציפית
@@ -94,13 +111,10 @@ public class PdfProcessingService {
         document = documentRepository.save(document);
 
         try {
-            // שמירת ה-ID במשתנה final לשימוש ב-lambda
             final Long documentId = document.getId();
 
-            byte[] fileContent = file.getBytes();
-
             DocumentProcessingEvent event = DocumentProcessingEvent.forProcessing(
-                    documentId,  // שימוש במשתנה הlocal
+                    documentId,
                     sessionUser.getId(),
                     chatSession.getId(),
                     originalFileName,
@@ -130,6 +144,9 @@ public class PdfProcessingService {
             log.error("שגיאה בהעברת קובץ PDF לעיבוד אסינכרוני: {} עבור שיחה {} של משתמש {}",
                     originalFileName, chatSession.getId(), sessionUser.getUsername(), e);
 
+            // במקרה של שגיאה, נמחק את הקובץ מ-MinIO
+            fileStorageService.deleteFile(storagePath);
+
             // עדכון סטטוס שגיאה
             document.setProcessingStatus(Document.ProcessingStatus.FAILED);
             document.setProcessingProgress(0);
@@ -138,6 +155,13 @@ public class PdfProcessingService {
 
             throw new IOException("לא ניתן להעביר את הקובץ לעיבוד: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * יצירת נתיב אחסון ב-MinIO
+     */
+    private String generateStoragePath(Long userId, Long sessionId, String fileName) {
+        return String.format("users/%d/sessions/%d/%s", userId, sessionId, fileName);
     }
 
     /**
@@ -164,32 +188,17 @@ public class PdfProcessingService {
      */
     public List<Document> getDocumentsBySession(ChatSession chatSession) {
         validateChatSession(chatSession);
-
         String cacheKey = "session_docs:" + chatSession.getId() + "_user:" + chatSession.getUser().getId();
 
         @SuppressWarnings("unchecked")
         List<Document> cachedDocs = (List<Document>) cacheService.getDocumentMetadata(cacheKey);
 
         if (cachedDocs != null) {
-            log.debug("Documents for session {} (user {}) retrieved from cache",
-                    chatSession.getId(), chatSession.getUser().getId());
             return cachedDocs;
         }
 
-        // Get from database with user verification - only active documents
         List<Document> documents = documentRepository.findByChatSessionAndActiveTrueOrderByCreatedAtDesc(chatSession);
-
-        // Verify all documents belong to the session's user (security check)
-        documents = documents.stream()
-                .filter(doc -> doc.getUser().getId().equals(chatSession.getUser().getId()))
-                .filter(doc -> doc.getChatSession().getId().equals(chatSession.getId()))
-                .collect(Collectors.toList());
-
-        // Cache for 6 hours
         cacheService.cacheDocumentMetadata(cacheKey, documents);
-        log.debug("Documents for session {} (user {}) retrieved from database and cached: {} documents",
-                chatSession.getId(), chatSession.getUser().getId(), documents.size());
-
         return documents;
     }
 
@@ -399,9 +408,7 @@ public class PdfProcessingService {
     // Helper methods
 
     private Optional<Document> findDuplicateInSession(ChatSession chatSession, String contentHash) {
-        // מציאת כפילויות רק בתוך אותה שיחה
         List<Document> sessionDocuments = getDocumentsBySession(chatSession);
-
         return sessionDocuments.stream()
                 .filter(doc -> contentHash.equals(doc.getContentHash()))
                 .findFirst();
@@ -437,7 +444,6 @@ public class PdfProcessingService {
     private void validateChatSessionForUpload(ChatSession chatSession) {
         validateChatSession(chatSession);
 
-        // בדיקות נוספות להעלאת קבצים
         if (chatSession.getUser() == null) {
             throw new IllegalArgumentException("שיחה ללא משתמש מקושר");
         }
