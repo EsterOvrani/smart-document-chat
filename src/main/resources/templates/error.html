@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>שגיאה - Smart Document Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            direction: rtl;
+        }
+
+        .error-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            padding: 60px 40px;
+            width: 100%;
+            max-width: 500px;
+            text-align: center;
+        }
+
+        .error-icon {
+            font-size: 5rem;
+            color: #ff6b6b;
+            margin-bottom: 30px;
+        }
+
+        .error-title {
+            font-size: 2.2rem;
+            color: #333;
+            margin-bottom: 20px;
+            font-weight: bold;
+        }
+
+        .error-message {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 40px;
+            line-height: 1.6;
+        }
+
+        .error-actions {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.2s;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
+        }
+
+        .btn-secondary:hover {
+            background: #667eea;
+            color: white;
+        }
+
+        .error-details {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 30px 0;
+            text-align: right;
+            font-family: monospace;
+            font-size: 14px;
+            color: #666;
+            display: none;
+        }
+
+        .show-details {
+            color: #667eea;
+            cursor: pointer;
+            text-decoration: underline;
+            font-size: 14px;
+            margin-top: 20px;
+            display: inline-block;
+        }
+
+        @media (max-width: 480px) {
+            .error-container {
+                margin: 20px;
+                padding: 40px 25px;
+            }
+
+            .error-title {
+                font-size: 1.8rem;
+            }
+
+            .error-actions {
+                flex-direction: column;
+                align-items: center;
+            }
+
+            .btn {
+                width: 100%;
+                max-width: 200px;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="error-container">
+    <div class="error-icon">⚠️</div>
+    <h1 class="error-title">אופס! משהו השתבש</h1>
+    <p class="error-message">
+        מצטערים, אירעה שגיאה במערכת. אנא נסה שוב מאוחר יותר או צור קשר עם התמיכה הטכנית.
+    </p>
+
+    <div class="error-actions">
+        <a href="/" class="btn btn-primary">חזור לדף הבית</a>
+        <a href="/login" class="btn btn-secondary">חזור להתחברות</a>
+    </div>
+
+    <span class="show-details" onclick="toggleDetails()">הצג פרטים טכניים</span>
+
+    <div class="error-details" id="errorDetails">
+        <strong>פרטי השגיאה:</strong><br>
+        Status: 500 - Internal Server Error<br>
+        Path: <span id="errorPath">/</span><br>
+        Time: <span id="errorTime"></span><br>
+        Session ID: <span id="sessionId">N/A</span>
+    </div>
+</div>
+
+<script>
+        // Set current time
+        document.getElementById('errorTime').textContent = new Date().toLocaleString('he-IL');
+
+        // Set current path
+        document.getElementById('errorPath').textContent = window.location.pathname;
+
+        function toggleDetails() {
+            const details = document.getElementById('errorDetails');
+            const showBtn = document.querySelector('.show-details');
+
+            if (details.style.display === 'none' || !details.style.display) {
+                details.style.display = 'block';
+                showBtn.textContent = 'הסתר פרטים טכניים';
+            } else {
+                details.style.display = 'none';
+                showBtn.textContent = 'הצג פרטים טכניים';
+            }
+        }
+
+        // Try to get session info
+        fetch('/api/auth/status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.sessionId) {
+                    document.getElementById('sessionId').textContent = data.sessionId;
+                }
+            })
+            .catch(error => {
+                console.log('Could not retrieve session info');
+            });
+    </script>
+</body>
+</html>

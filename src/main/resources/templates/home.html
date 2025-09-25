@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl" xmlns:th="http://www.thymeleaf.org"
+      xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>דף הבית - Smart Document Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+            direction: rtl;
+        }
+
+        .header {
+            background: white;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .welcome-text {
+            color: #333;
+            font-weight: 500;
+        }
+
+        .logout-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 14px;
+            transition: background-color 0.2s;
+        }
+
+        .logout-btn:hover {
+            background: #5a6fd8;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        .main-content {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            padding: 40px;
+            text-align: center;
+        }
+
+        .page-title {
+            font-size: 2.5rem;
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        .page-subtitle {
+            color: #666;
+            font-size: 1.2rem;
+            margin-bottom: 40px;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 30px;
+            margin-top: 40px;
+        }
+
+        .feature-card {
+            background: #f8f9ff;
+            padding: 30px;
+            border-radius: 12px;
+            border: 1px solid #e1e8ed;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.1);
+        }
+
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 15px;
+        }
+
+        .feature-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .feature-description {
+            color: #666;
+            line-height: 1.6;
+        }
+
+        .api-status {
+            background: #e8f5e8;
+            border: 1px solid #c3e6c3;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 30px 0;
+            text-align: center;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #28a745;
+            border-radius: 50%;
+            margin-left: 8px;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: 40px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.2s;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
+        }
+
+        .btn-secondary:hover {
+            background: #667eea;
+            color: white;
+        }
+
+        @media (max-width: 768px) {
+            .header {
+                padding: 1rem;
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+
+            .user-info {
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .container {
+                padding: 20px 15px;
+            }
+
+            .main-content {
+                padding: 30px 20px;
+            }
+
+            .page-title {
+                font-size: 2rem;
+            }
+
+            .action-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+
+            .btn {
+                width: 100%;
+                max-width: 250px;
+            }
+        }
+    </style>
+</head>
+<body>
+<header class="header">
+    <div class="logo">📚 Smart Document Chat</div>
+    <div class="user-info">
+        <span class="welcome-text" sec:authentication="name">שלום, משתמש</span>
+        <a href="/api/auth/logout" class="logout-btn" onclick="return confirmLogout()">התנתק</a>
+    </div>
+</header>
+
+<div class="container">
+    <div class="main-content">
+        <h1 class="page-title">ברוכים הבאים למערכת הניהול החכם</h1>
+        <p class="page-subtitle">העלו מסמכים ושאלו עליהם באמצעות בינה מלאכותית</p>
+
+        <div class="api-status">
+            <span class="status-indicator"></span>
+            מערכת פעילה ומוכנה לשימוש
+        </div>
+
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">📄</div>
+                <h3 class="feature-title">העלאת מסמכים</h3>
+                <p class="feature-description">העלו קבצי PDF ועבדו איתם באמצעות טכנולוגיית AI מתקדמת</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">💬</div>
+                <h3 class="feature-title">צ'אט חכם</h3>
+                <p class="feature-description">שאלו שאלות על המסמכים שלכם וקבלו תשובות מדויקות ומהירות</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">🔍</div>
+                <h3 class="feature-title">חיפוש מתקדם</h3>
+                <p class="feature-description">מצאו מידע ספציפי בתוך המסמכים שלכם במהירות ובדיוק</p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">📊</div>
+                <h3 class="feature-title">ניתוח נתונים</h3>
+                <p class="feature-description">קבלו סיכומים וניתוחים של המסמכים שלכם</p>
+            </div>
+        </div>
+
+        <div class="action-buttons">
+            <button class="btn btn-primary" onclick="startNewChat()">התחל שיחה חדשה</button>
+            <button class="btn btn-secondary" onclick="viewSessions()">צפה בשיחות קיימות</button>
+            <button class="btn btn-secondary" onclick="uploadDocument()">העלה מסמך</button>
+        </div>
+    </div>
+</div>
+
+<script>
+        function confirmLogout() {
+            return confirm('האם אתה בטוח שברצונך להתנתק?');
+        }
+
+        function startNewChat() {
+            // In the future, this will redirect to the chat interface
+            alert('תכונה זו תתאפשר בקרוב');
+        }
+
+        function viewSessions() {
+            // In the future, this will show existing chat sessions
+            alert('תכונה זו תתאפשר בקרוב');
+        }
+
+        function uploadDocument() {
+            // In the future, this will open document upload interface
+            alert('תכונה זו תתאפשר בקרוב');
+        }
+
+        // Check if user is authenticated via API
+        fetch('/api/auth/status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.success && data.authenticated && data.user) {
+                    document.querySelector('.welcome-text').textContent =
+                        `שלום, ${data.user.fullName || data.user.username}`;
+                }
+            })
+            .catch(error => {
+                console.error('Error checking auth status:', error);
+            });
+    </script>
+</body>
+</html>
