@@ -2,10 +2,12 @@ package com.smartdocumentchat.controller;
 
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.service.UserService;
+import com.smartdocumentchat.util.AuthenticationUtils;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
@@ -20,72 +22,36 @@ public class UserController {
     private final UserService userService;
 
     /**
-     * רישום משתמש חדש
+     * רישום משתמש חדש - מועבר ל-AuthController
      */
+    @Deprecated
     @PostMapping("/register")
     public ResponseEntity<?> registerUser(@RequestBody UserRegistrationRequest request) {
-        try {
-            // בדיקת תקינות הנתונים
-            if (request.getUsername() == null || request.getUsername().trim().isEmpty()) {
-                return ResponseEntity.badRequest().body(Map.of(
+        return ResponseEntity.status(HttpStatus.MOVED_PERMANENTLY)
+                .body(Map.of(
                         "success", false,
-                        "error", "שם משתמש הוא שדה חובה"
+                        "error", "נא להשתמש ב-/api/auth/register",
+                        "redirectTo", "/api/auth/register"
                 ));
-            }
-
-            if (request.getEmail() == null || request.getEmail().trim().isEmpty()) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "אימייל הוא שדה חובה"
-                ));
-            }
-
-            // יצירת המשתמש
-            User newUser = userService.createUser(
-                    request.getUsername().trim(),
-                    request.getEmail().trim(),
-                    request.getFirstName() != null ? request.getFirstName().trim() : null,
-                    request.getLastName() != null ? request.getLastName().trim() : null
-            );
-
-            log.info("משתמש חדש נרשם: {}", newUser.getUsername());
-
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "message", "משתמש נרשם בהצלחה",
-                    "user", Map.of(
-                            "id", newUser.getId(),
-                            "username", newUser.getUsername(),
-                            "email", newUser.getEmail(),
-                            "fullName", newUser.getFullName(),
-                            "createdAt", newUser.getCreatedAt().format(
-                                    java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
-                            )
-                    )
-            ));
-
-        } catch (IllegalArgumentException e) {
-            log.warn("שגיאה ברישום משתמש: {}", e.getMessage());
-            return ResponseEntity.badRequest().body(Map.of(
-                    "success", false,
-                    "error", e.getMessage()
-            ));
-
-        } catch (Exception e) {
-            log.error("שגיאה כללית ברישום משתמש", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "error", "שגיאה לא צפויה ברישום המשתמש"
-            ));
-        }
     }
 
     /**
-     * קבלת פרטי משתמש לפי ID
+     * קבלת פרטי משתמש לפי ID - עם בדיקת הרשאות
      */
     @GetMapping("/{userId}")
+    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId) or hasRole('ADMIN')")
     public ResponseEntity<?> getUserById(@PathVariable Long userId) {
         try {
+            // Additional security check
+            if (!AuthenticationUtils.isCurrentUser(userId)) {
+                log.warn("משתמש {} ניסה לגשת לפרטי משתמש {} אחר",
+                        AuthenticationUtils.getCurrentUserId().orElse(-1L), userId);
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לצפות בפרטי משתמש אחר"
+                ));
+            }
+
             Optional<User> userOpt = userService.findById(userId);
 
             if (userOpt.isEmpty()) {
@@ -124,14 +90,24 @@ public class UserController {
     }
 
     /**
-     * עדכון פרטי משתמש
+     * עדכון פרטי משתמש - עם בדיקת הרשאות
      */
     @PutMapping("/{userId}")
+    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId)")
     public ResponseEntity<?> updateUser(
             @PathVariable Long userId,
             @RequestBody UserUpdateRequest request) {
         try {
-            // כרגע נעדכן רק שם פרטי ושם משפחה (בשלב 9 נוסיף authentication)
+            // Additional security check
+            if (!AuthenticationUtils.isCurrentUser(userId)) {
+                log.warn("משתמש {} ניסה לעדכן פרטי משתמש {} אחר",
+                        AuthenticationUtils.getCurrentUserId().orElse(-1L), userId);
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לעדכן פרטי משתמש אחר"
+                ));
+            }
+
             User updatedUser = userService.updateUser(
                     userId,
                     request.getFirstName(),
@@ -166,13 +142,21 @@ public class UserController {
     }
 
     /**
-     * קבלת פרטי המשתמש הנוכחי (דמו - בשלב 9 נוסיף authentication אמיתי)
+     * קבלת פרטי המשתמש הנוכחי - משתמש ב-Spring Security
      */
     @GetMapping("/current")
     public ResponseEntity<?> getCurrentUser() {
         try {
-            // כרגע נחזיר את המשתמש הדמו
-            User currentUser = userService.getOrCreateDemoUser();
+            Optional<User> currentUserOpt = AuthenticationUtils.getCurrentUser();
+
+            if (currentUserOpt.isEmpty()) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                        "success", false,
+                        "error", "משתמש לא מחובר"
+                ));
+            }
+
+            User currentUser = currentUserOpt.get();
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -197,11 +181,22 @@ public class UserController {
     }
 
     /**
-     * השבתת משתמש
+     * השבתת משתמש - רק המשתמש עצמו יכול להשבית את עצמו
      */
     @DeleteMapping("/{userId}")
+    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId)")
     public ResponseEntity<?> deactivateUser(@PathVariable Long userId) {
         try {
+            // Additional security check
+            if (!AuthenticationUtils.isCurrentUser(userId)) {
+                log.warn("משתמש {} ניסה להשבית משתמש {} אחר",
+                        AuthenticationUtils.getCurrentUserId().orElse(-1L), userId);
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה להשבית משתמש אחר"
+                ));
+            }
+
             boolean deactivated = userService.deactivateUser(userId);
 
             if (!deactivated) {
@@ -226,30 +221,132 @@ public class UserController {
     }
 
     /**
-     * בדיקת זמינות שם משתמש
+     * בדיקת זמינות שם משתמש - מוזז ל-AuthController
      */
+    @Deprecated
     @GetMapping("/check-username/{username}")
     public ResponseEntity<?> checkUsernameAvailability(@PathVariable String username) {
+        return ResponseEntity.status(HttpStatus.MOVED_PERMANENTLY)
+                .body(Map.of(
+                        "success", false,
+                        "error", "נא להשתמש ב-/api/auth/check-username/{username}",
+                        "redirectTo", "/api/auth/check-username/" + username
+                ));
+    }
+
+    /**
+     * עדכון אימייל - עם בדיקת הרשאות
+     */
+    @PutMapping("/{userId}/email")
+    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId)")
+    public ResponseEntity<?> updateEmail(
+            @PathVariable Long userId,
+            @RequestBody EmailUpdateRequest request) {
         try {
-            Optional<User> existingUser = userService.findByUsername(username);
+            // Additional security check
+            if (!AuthenticationUtils.isCurrentUser(userId)) {
+                log.warn("משתמש {} ניסה לעדכן אימייל של משתמש {} אחר",
+                        AuthenticationUtils.getCurrentUserId().orElse(-1L), userId);
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לעדכן אימייל של משתמש אחר"
+                ));
+            }
+
+            if (request.getEmail() == null || request.getEmail().trim().isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "אימייל הוא שדה חובה"
+                ));
+            }
+
+            User updatedUser = userService.updateEmail(userId, request.getEmail());
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
-                    "available", existingUser.isEmpty(),
-                    "message", existingUser.isEmpty() ?
-                            "שם המשתמש זמין" : "שם המשתמש כבר תפוס"
+                    "message", "אימייל עודכן בהצלחה",
+                    "user", Map.of(
+                            "id", updatedUser.getId(),
+                            "username", updatedUser.getUsername(),
+                            "email", updatedUser.getEmail()
+                    )
+            ));
+
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
             ));
 
         } catch (Exception e) {
-            log.error("שגיאה בבדיקת זמינות שם משתמש: {}", username, e);
+            log.error("שגיאה בעדכון אימייל למשתמש: {}", userId, e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
                     "success", false,
-                    "error", "שגיאה בבדיקת זמינות שם המשתמש"
+                    "error", "שגיאה בעדכון האימייל"
             ));
         }
     }
 
-    // Inner classes for request DTOs
+    /**
+     * שינוי סיסמה - עם בדיקת הרשאות
+     */
+    @PutMapping("/{userId}/password")
+    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId)")
+    public ResponseEntity<?> changePassword(
+            @PathVariable Long userId,
+            @RequestBody PasswordChangeRequest request) {
+        try {
+            // Additional security check
+            if (!AuthenticationUtils.isCurrentUser(userId)) {
+                log.warn("משתמש {} ניסה לשנות סיסמה של משתמש {} אחר",
+                        AuthenticationUtils.getCurrentUserId().orElse(-1L), userId);
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                        "success", false,
+                        "error", "אין הרשאה לשנות סיסמה של משתמש אחר"
+                ));
+            }
+
+            if (request.getOldPassword() == null || request.getNewPassword() == null) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "סיסמה ישנה וחדשה הן שדות חובה"
+                ));
+            }
+
+            boolean changed = userService.changePassword(
+                    userId,
+                    request.getOldPassword(),
+                    request.getNewPassword()
+            );
+
+            if (!changed) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "סיסמה ישנה שגויה"
+                ));
+            }
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "סיסמה שונתה בהצלחה"
+            ));
+
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בשינוי סיסמה למשתמש: {}", userId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בשינוי הסיסמה"
+            ));
+        }
+    }
+
+    // Request DTOs
 
     public static class UserRegistrationRequest {
         private String username;
@@ -257,7 +354,6 @@ public class UserController {
         private String firstName;
         private String lastName;
 
-        // Constructors
         public UserRegistrationRequest() {}
 
         public UserRegistrationRequest(String username, String email, String firstName, String lastName) {
@@ -267,7 +363,6 @@ public class UserController {
             this.lastName = lastName;
         }
 
-        // Getters and setters
         public String getUsername() { return username; }
         public void setUsername(String username) { this.username = username; }
 
@@ -285,7 +380,6 @@ public class UserController {
         private String firstName;
         private String lastName;
 
-        // Constructors
         public UserUpdateRequest() {}
 
         public UserUpdateRequest(String firstName, String lastName) {
@@ -293,11 +387,41 @@ public class UserController {
             this.lastName = lastName;
         }
 
-        // Getters and setters
         public String getFirstName() { return firstName; }
         public void setFirstName(String firstName) { this.firstName = firstName; }
 
         public String getLastName() { return lastName; }
         public void setLastName(String lastName) { this.lastName = lastName; }
+    }
+
+    public static class EmailUpdateRequest {
+        private String email;
+
+        public EmailUpdateRequest() {}
+
+        public EmailUpdateRequest(String email) {
+            this.email = email;
+        }
+
+        public String getEmail() { return email; }
+        public void setEmail(String email) { this.email = email; }
+    }
+
+    public static class PasswordChangeRequest {
+        private String oldPassword;
+        private String newPassword;
+
+        public PasswordChangeRequest() {}
+
+        public PasswordChangeRequest(String oldPassword, String newPassword) {
+            this.oldPassword = oldPassword;
+            this.newPassword = newPassword;
+        }
+
+        public String getOldPassword() { return oldPassword; }
+        public void setOldPassword(String oldPassword) { this.oldPassword = oldPassword; }
+
+        public String getNewPassword() { return newPassword; }
+        public void setNewPassword(String newPassword) { this.newPassword = newPassword; }
     }
 }

@@ -1,14 +1,23 @@
 package com.smartdocumentchat.controller;
 
 import com.smartdocumentchat.entity.User;
+import com.smartdocumentchat.service.CustomUserDetailsService;
 import com.smartdocumentchat.service.UserService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.web.authentication.logout.SecurityContextLogoutHandler;
 import org.springframework.web.bind.annotation.*;
 
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
 import java.util.Map;
 import java.util.Optional;
@@ -20,6 +29,7 @@ import java.util.Optional;
 public class AuthController {
 
     private final UserService userService;
+    private final AuthenticationManager authenticationManager;
 
     /**
      * רישום משתמש חדש
@@ -91,7 +101,7 @@ public class AuthController {
     }
 
     /**
-     * התחברות משתמש
+     * התחברות משתמש - עדכן לשימוש ב-Spring Security
      */
     @PostMapping("/login")
     public ResponseEntity<?> login(@RequestBody LoginRequest request, HttpServletRequest httpRequest) {
@@ -111,47 +121,30 @@ public class AuthController {
                 ));
             }
 
-            // חיפוש משתמש לפי שם משתמש או אימייל
-            Optional<User> userOpt = userService.findByUsername(request.getUsername());
-            if (userOpt.isEmpty()) {
-                userOpt = userService.findByEmail(request.getUsername());
-            }
+            // יצירת authentication token
+            UsernamePasswordAuthenticationToken authRequest =
+                    new UsernamePasswordAuthenticationToken(
+                            request.getUsername().trim(),
+                            request.getPassword()
+                    );
 
-            if (userOpt.isEmpty()) {
-                log.warn("ניסיון התחברות עם משתמש לא קיים: {}", request.getUsername());
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "שם משתמש או סיסמה שגויים"
-                ));
-            }
+            // ביצוע authentication
+            Authentication authentication = authenticationManager.authenticate(authRequest);
 
-            User user = userOpt.get();
+            // הגדרת authentication בcontext
+            SecurityContextHolder.getContext().setAuthentication(authentication);
 
-            // בדיקה שהמשתמש פעיל
-            if (!user.getActive()) {
-                log.warn("ניסיון התחברות עם משתמש לא פעיל: {}", user.getUsername());
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "משתמש לא פעיל"
-                ));
-            }
-
-            // אימות סיסמה
-            if (!userService.verifyPassword(request.getPassword(), user.getPasswordHash())) {
-                log.warn("ניסיון התחברות עם סיסמה שגויה למשתמש: {}", user.getUsername());
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "שם משתמש או סיסמה שגויים"
-                ));
-            }
+            // קבלת המשתמש מה-authentication
+            CustomUserDetailsService.CustomUserPrincipal userPrincipal =
+                    (CustomUserDetailsService.CustomUserPrincipal) authentication.getPrincipal();
+            User user = userPrincipal.getUser();
 
             // יצירת session
             HttpSession session = httpRequest.getSession(true);
-            session.setAttribute("userId", user.getId());
-            session.setAttribute("username", user.getUsername());
+            session.setAttribute("SPRING_SECURITY_CONTEXT", SecurityContextHolder.getContext());
             session.setMaxInactiveInterval(30 * 60); // 30 דקות
 
-            log.info("משתמש {} התחבר בהצלחה", user.getUsername());
+            log.info("משתמש {} התחבר בהצלחה באמצעות Spring Security", user.getUsername());
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -165,6 +158,20 @@ public class AuthController {
                     )
             ));
 
+        } catch (BadCredentialsException e) {
+            log.warn("ניסיון התחברות עם credentials שגויים: {}", request.getUsername());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                    "success", false,
+                    "error", "שם משתמש או סיסמה שגויים"
+            ));
+
+        } catch (UsernameNotFoundException e) {
+            log.warn("ניסיון התחברות עם משתמש לא קיים: {}", request.getUsername());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                    "success", false,
+                    "error", "שם משתמש או סיסמה שגויים"
+            ));
+
         } catch (Exception e) {
             log.error("שגיאה כללית בהתחברות", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
@@ -175,18 +182,32 @@ public class AuthController {
     }
 
     /**
-     * התנתקות משתמש
+     * התנתקות משתמש - עדכן לשימוש ב-Spring Security
      */
     @PostMapping("/logout")
-    public ResponseEntity<?> logout(HttpServletRequest request) {
+    public ResponseEntity<?> logout(HttpServletRequest request, HttpServletResponse response) {
         try {
-            HttpSession session = request.getSession(false);
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            String username = "unknown";
 
-            if (session != null) {
-                String username = (String) session.getAttribute("username");
-                session.invalidate();
-                log.info("משתמש {} התנתק בהצלחה", username);
+            if (auth != null && auth.getPrincipal() instanceof CustomUserDetailsService.CustomUserPrincipal) {
+                CustomUserDetailsService.CustomUserPrincipal userPrincipal =
+                        (CustomUserDetailsService.CustomUserPrincipal) auth.getPrincipal();
+                username = userPrincipal.getUsername();
             }
+
+            // ביצוע logout באמצעות Spring Security
+            if (auth != null) {
+                new SecurityContextLogoutHandler().logout(request, response, auth);
+            }
+
+            // ניקוי session
+            HttpSession session = request.getSession(false);
+            if (session != null) {
+                session.invalidate();
+            }
+
+            log.info("משתמש {} התנתק בהצלחה", username);
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -203,14 +224,15 @@ public class AuthController {
     }
 
     /**
-     * בדיקת סטטוס התחברות
+     * בדיקת סטטוס התחברות - עדכן לשימוש ב-Spring Security
      */
     @GetMapping("/status")
-    public ResponseEntity<?> getAuthStatus(HttpServletRequest request) {
+    public ResponseEntity<?> getAuthStatus() {
         try {
-            HttpSession session = request.getSession(false);
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
-            if (session == null) {
+            if (auth == null || !auth.isAuthenticated() ||
+                    "anonymousUser".equals(auth.getPrincipal().toString())) {
                 return ResponseEntity.ok(Map.of(
                         "success", true,
                         "authenticated", false,
@@ -218,40 +240,29 @@ public class AuthController {
                 ));
             }
 
-            Long userId = (Long) session.getAttribute("userId");
-            String username = (String) session.getAttribute("username");
+            if (auth.getPrincipal() instanceof CustomUserDetailsService.CustomUserPrincipal) {
+                CustomUserDetailsService.CustomUserPrincipal userPrincipal =
+                        (CustomUserDetailsService.CustomUserPrincipal) auth.getPrincipal();
+                User user = userPrincipal.getUser();
 
-            if (userId == null || username == null) {
                 return ResponseEntity.ok(Map.of(
                         "success", true,
-                        "authenticated", false,
-                        "message", "session לא תקין"
+                        "authenticated", true,
+                        "user", Map.of(
+                                "id", user.getId(),
+                                "username", user.getUsername(),
+                                "email", user.getEmail(),
+                                "fullName", user.getFullName()
+                        ),
+                        "authorities", auth.getAuthorities()
                 ));
             }
-
-            // וידוא שהמשתמש עדיין קיים ופעיל
-            Optional<User> userOpt = userService.findById(userId);
-            if (userOpt.isEmpty() || !userOpt.get().getActive()) {
-                session.invalidate();
-                return ResponseEntity.ok(Map.of(
-                        "success", true,
-                        "authenticated", false,
-                        "message", "משתמש לא קיים או לא פעיל"
-                ));
-            }
-
-            User user = userOpt.get();
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "authenticated", true,
-                    "user", Map.of(
-                            "id", user.getId(),
-                            "username", user.getUsername(),
-                            "email", user.getEmail(),
-                            "fullName", user.getFullName()
-                    ),
-                    "sessionId", session.getId()
+                    "username", auth.getName(),
+                    "authorities", auth.getAuthorities()
             ));
 
         } catch (Exception e) {
