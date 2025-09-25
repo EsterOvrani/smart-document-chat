@@ -4,6 +4,7 @@ import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -20,17 +21,19 @@ import java.util.Base64;
 public class UserService {
 
     private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
 
     // Validation patterns
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
             "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
     );
 
+
     private static final Pattern USERNAME_PATTERN = Pattern.compile(
             "^[a-zA-Z0-9_]{3,20}$"
     );
 
-    // Password requirements (basic for now)
+    // Password requirements
     private static final int MIN_PASSWORD_LENGTH = 6;
     private static final int MAX_PASSWORD_LENGTH = 100;
 
@@ -42,7 +45,7 @@ public class UserService {
     }
 
     /**
-     * יצירת משתמש חדש עם סיסמה
+     * יצירת משתמש חדש עם סיסמה - עודכן לשימוש ב-BCrypt
      */
     public User createUserWithPassword(String username, String email, String firstName,
                                        String lastName, String password) {
@@ -52,8 +55,8 @@ public class UserService {
         validateUserInput(username, email, password);
         validateUserUniqueness(username, email);
 
-        // Hash password
-        String hashedPassword = hashPassword(password);
+        // Hash password with BCrypt
+        String hashedPassword = passwordEncoder.encode(password);
 
         // Create user entity
         User user = new User();
@@ -67,6 +70,52 @@ public class UserService {
         User savedUser = userRepository.save(user);
         log.info("משתמש חדש נוצר בהצלחה: {} (ID: {})", savedUser.getUsername(), savedUser.getId());
         return savedUser;
+    }
+
+
+    /**
+     * אימות סיסמה - עודכן לשימוש ב-BCrypt
+     */
+    public boolean verifyPassword(String rawPassword, String hashedPassword) {
+        try {
+            return passwordEncoder.matches(rawPassword, hashedPassword);
+        } catch (Exception e) {
+            log.error("שגיאה באימות סיסמה", e);
+            return false;
+        }
+    }
+
+    /**
+     * שינוי סיסמה - עודכן לשימוש ב-BCrypt
+     */
+    public boolean changePassword(Long userId, String oldPassword, String newPassword) {
+        if (userId == null || userId <= 0) {
+            throw new IllegalArgumentException("מזהה משתמש לא תקין");
+        }
+
+        Optional<User> userOpt = userRepository.findById(userId);
+        if (userOpt.isEmpty()) {
+            throw new IllegalArgumentException("משתמש לא נמצא");
+        }
+
+        User user = userOpt.get();
+
+        // Verify old password with BCrypt
+        if (!verifyPassword(oldPassword, user.getPasswordHash())) {
+            log.warn("ניסיון שינוי סיסמה עם סיסמה ישנה שגויה למשתמש: {}", user.getUsername());
+            return false;
+        }
+
+        // Validate new password
+        validatePassword(newPassword);
+
+        // Hash new password with BCrypt
+        String newHashedPassword = passwordEncoder.encode(newPassword);
+        user.setPasswordHash(newHashedPassword);
+
+        userRepository.save(user);
+        log.info("סיסמה של משתמש {} שונתה בהצלחה", user.getUsername());
+        return true;
     }
 
     /**
@@ -106,7 +155,7 @@ public class UserService {
     }
 
     /**
-     * יצירת משתמש דמה לבדיקות (משופר)
+     * יצירת משתמש דמה לבדיקות (משופר עם BCrypt)
      */
     public User getOrCreateDemoUser() {
         Optional<User> existingUser = userRepository.findByUsername("demo_user");
@@ -183,38 +232,7 @@ public class UserService {
         return updatedUser;
     }
 
-    /**
-     * שינוי סיסמה (בסיסי)
-     */
-    public boolean changePassword(Long userId, String oldPassword, String newPassword) {
-        if (userId == null || userId <= 0) {
-            throw new IllegalArgumentException("מזהה משתמש לא תקין");
-        }
 
-        Optional<User> userOpt = userRepository.findById(userId);
-        if (userOpt.isEmpty()) {
-            throw new IllegalArgumentException("משתמש לא נמצא");
-        }
-
-        User user = userOpt.get();
-
-        // Verify old password (basic check for now)
-        if (!verifyPassword(oldPassword, user.getPasswordHash())) {
-            log.warn("ניסיון שינוי סיסמה עם סיסמה ישנה שגויה למשתמש: {}", user.getUsername());
-            return false;
-        }
-
-        // Validate new password
-        validatePassword(newPassword);
-
-        // Hash new password
-        String newHashedPassword = hashPassword(newPassword);
-        user.setPasswordHash(newHashedPassword);
-
-        userRepository.save(user);
-        log.info("סיסמה של משתמש {} שונתה בהצלחה", user.getUsername());
-        return true;
-    }
 
     /**
      * השבתת משתמש (soft delete) עם validation
@@ -376,56 +394,30 @@ public class UserService {
                 .substring(0, Math.min(name.trim().length(), 50)); // Limit length
     }
 
-    // Basic password handling (will be enhanced in Phase 9)
+//    // Basic password handling (will be enhanced in Phase 9)
+//    private String hashPassword(String password) {
+//        try {
+//            // Generate salt
+//            SecureRandom random = new SecureRandom();
+//            byte[] salt = new byte[16];
+//            random.nextBytes(salt);
+//
+//            // Hash password with salt
+//            MessageDigest md = MessageDigest.getInstance("SHA-256");
+//            md.update(salt);
+//            byte[] hashedPassword = md.digest(password.getBytes());
+//
+//            // Combine salt and hash
+//            byte[] combined = new byte[salt.length + hashedPassword.length];
+//            System.arraycopy(salt, 0, combined, 0, salt.length);
+//            System.arraycopy(hashedPassword, 0, combined, salt.length, hashedPassword.length);
+//
+//            return Base64.getEncoder().encodeToString(combined);
+//
+//        } catch (NoSuchAlgorithmException e) {
+//            log.error("שגיאה בhashing של סיסמה", e);
+//            throw new RuntimeException("שגיאה פנימית בעיבוד הסיסמה");
+//        }
+//    }
 
-    private String hashPassword(String password) {
-        try {
-            // Generate salt
-            SecureRandom random = new SecureRandom();
-            byte[] salt = new byte[16];
-            random.nextBytes(salt);
-
-            // Hash password with salt
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            md.update(salt);
-            byte[] hashedPassword = md.digest(password.getBytes());
-
-            // Combine salt and hash
-            byte[] combined = new byte[salt.length + hashedPassword.length];
-            System.arraycopy(salt, 0, combined, 0, salt.length);
-            System.arraycopy(hashedPassword, 0, combined, salt.length, hashedPassword.length);
-
-            return Base64.getEncoder().encodeToString(combined);
-
-        } catch (NoSuchAlgorithmException e) {
-            log.error("שגיאה בhashing של סיסמה", e);
-            throw new RuntimeException("שגיאה פנימית בעיבוד הסיסמה");
-        }
-    }
-
-    private boolean verifyPassword(String password, String hashedPassword) {
-        try {
-            byte[] combined = Base64.getDecoder().decode(hashedPassword);
-
-            // Extract salt (first 16 bytes)
-            byte[] salt = new byte[16];
-            System.arraycopy(combined, 0, salt, 0, 16);
-
-            // Extract hash (remaining bytes)
-            byte[] storedHash = new byte[combined.length - 16];
-            System.arraycopy(combined, 16, storedHash, 0, storedHash.length);
-
-            // Hash provided password with stored salt
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            md.update(salt);
-            byte[] computedHash = md.digest(password.getBytes());
-
-            // Compare hashes
-            return MessageDigest.isEqual(storedHash, computedHash);
-
-        } catch (Exception e) {
-            log.error("שגיאה באימות סיסמה", e);
-            return false;
-        }
-    }
 }
