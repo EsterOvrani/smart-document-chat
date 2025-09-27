@@ -1,5 +1,6 @@
 package com.smartdocumentchat.config;
 
+import com.smartdocumentchat.config.JwtAuthenticationFilter;
 import com.smartdocumentchat.service.CustomUserDetailsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -10,9 +11,11 @@ import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
 import org.springframework.security.web.authentication.AuthenticationFailureHandler;
 import org.springframework.security.web.authentication.logout.LogoutSuccessHandler;
@@ -24,7 +27,7 @@ import org.springframework.security.web.authentication.logout.LogoutSuccessHandl
 public class SecurityConfig {
 
     private final CustomUserDetailsService userDetailsService;
-//    private final SessionAuthenticationFilter sessionAuthenticationFilter;
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
 
     @Bean
     public PasswordEncoder passwordEncoder() {
@@ -46,24 +49,34 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
-        log.info("Configuring security filter chain with basic authentication");
+        log.info("Configuring security filter chain with JWT authentication");
 
         http
-                .csrf(csrf -> csrf.disable()) // נזהר מזה בproduction
+                // Disable CSRF for JWT (stateless)
+                .csrf(csrf -> csrf.disable())
+
+                // Set session management to stateless (no sessions with JWT)
+                .sessionManagement(session ->
+                        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+                // Configure authorization rules
                 .authorizeHttpRequests(authz -> authz
-                        // Authentication endpoints
+                        // Authentication endpoints - always allow
                         .requestMatchers("/api/auth/**").permitAll()
                         .requestMatchers("/api/status").permitAll()
                         .requestMatchers("/actuator/**").permitAll()
 
-                        // Login page and static resources
+                        // Static resources and login page - allow
                         .requestMatchers("/login", "/error", "/css/**", "/js/**", "/images/**").permitAll()
 
                         // All other requests require authentication
                         .anyRequest().authenticated()
                 )
 
-                // Form login configuration
+                // Add JWT filter before UsernamePasswordAuthenticationFilter
+                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+
+                // Form login configuration (for web interface)
                 .formLogin(form -> form
                         .loginPage("/login")
                         .loginProcessingUrl("/api/auth/login")
@@ -80,26 +93,20 @@ public class SecurityConfig {
                         .logoutSuccessHandler(logoutSuccessHandler())
                         .invalidateHttpSession(true)
                         .clearAuthentication(true)
-                        .deleteCookies("JSESSIONID", "SMARTDOC_SESSION")
+                        .deleteCookies("JSESSIONID", "JWT_TOKEN")
                         .permitAll()
-                )
-
-                // Session management
-                .sessionManagement(session -> session
-                        .maximumSessions(1)
-                        .maxSessionsPreventsLogin(false)
-                        .sessionRegistry(sessionRegistry())
                 )
 
                 // Security headers
                 .headers(headers -> headers
                         .frameOptions(frame -> frame.sameOrigin())
                         .contentTypeOptions(Customizer.withDefaults())
-                        .referrerPolicy(referrer -> referrer.policy(org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+                        .referrerPolicy(referrer ->
+                                referrer.policy(org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
                 );
 
 
-        log.info("Security filter chain configured successfully with form-based authentication");
+        log.info("Security filter chain configured successfully with JWT authentication");
         return http.build();
     }
 
@@ -128,8 +135,7 @@ public class SecurityConfig {
             response.setStatus(401);
             response.setContentType("application/json;charset=UTF-8");
 
-            String jsonResponse = String.format(
-                    "{\"success\": false, \"error\": \"שם משתמש או סיסמה שגויים\"}");
+            String jsonResponse = "{\"success\": false, \"error\": \"שם משתמש או סיסמה שגויים\"}";
 
             response.getWriter().write(jsonResponse);
         };
@@ -148,10 +154,5 @@ public class SecurityConfig {
 
             response.getWriter().write(jsonResponse);
         };
-    }
-
-    @Bean
-    public org.springframework.security.core.session.SessionRegistry sessionRegistry() {
-        return new org.springframework.security.core.session.SessionRegistryImpl();
     }
 }
