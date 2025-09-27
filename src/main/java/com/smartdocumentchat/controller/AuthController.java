@@ -3,6 +3,7 @@ package com.smartdocumentchat.controller;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.service.CustomUserDetailsService;
 import com.smartdocumentchat.service.UserService;
+import com.smartdocumentchat.util.JwtUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -16,9 +17,9 @@ import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.web.authentication.logout.SecurityContextLogoutHandler;
 import org.springframework.web.bind.annotation.*;
 
+import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import jakarta.servlet.http.HttpSession;
 import java.util.Map;
 import java.util.Optional;
 
@@ -30,9 +31,10 @@ public class AuthController {
 
     private final UserService userService;
     private final AuthenticationManager authenticationManager;
+    private final JwtUtil jwtUtil;
 
     /**
-     * רישום משתמש חדש
+     * רישום משתמש חדש - עדכן לJWT
      */
     @PostMapping("/register")
     public ResponseEntity<?> register(@RequestBody RegisterRequest request) {
@@ -70,6 +72,18 @@ public class AuthController {
 
             log.info("משתמש חדש נרשם: {}", newUser.getUsername());
 
+            // יצירת JWT tokens למשתמש החדש
+            String accessToken = jwtUtil.generateAccessToken(
+                    newUser.getUsername(),
+                    newUser.getId(),
+                    newUser.getEmail()
+            );
+
+            String refreshToken = jwtUtil.generateRefreshToken(
+                    newUser.getUsername(),
+                    newUser.getId()
+            );
+
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "message", "משתמש נרשם בהצלחה",
@@ -81,7 +95,9 @@ public class AuthController {
                             "createdAt", newUser.getCreatedAt().format(
                                     java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
                             )
-                    )
+                    ),
+                    "accessToken", accessToken,
+                    "refreshToken", refreshToken
             ));
 
         } catch (IllegalArgumentException e) {
@@ -101,10 +117,11 @@ public class AuthController {
     }
 
     /**
-     * התחברות משתמש - עדכן לשימוש ב-Spring Security
+     * התחברות משתמש - עדכן לJWT
      */
     @PostMapping("/login")
-    public ResponseEntity<?> login(@RequestBody LoginRequest request, HttpServletRequest httpRequest) {
+    public ResponseEntity<?> login(@RequestBody LoginRequest request,
+                                   HttpServletResponse response) {
         try {
             // בדיקת תקינות הנתונים
             if (request.getUsername() == null || request.getUsername().trim().isEmpty()) {
@@ -131,20 +148,31 @@ public class AuthController {
             // ביצוע authentication
             Authentication authentication = authenticationManager.authenticate(authRequest);
 
-            // הגדרת authentication בcontext
-            SecurityContextHolder.getContext().setAuthentication(authentication);
-
             // קבלת המשתמש מה-authentication
             CustomUserDetailsService.CustomUserPrincipal userPrincipal =
                     (CustomUserDetailsService.CustomUserPrincipal) authentication.getPrincipal();
             User user = userPrincipal.getUser();
 
-            // יצירת session
-            HttpSession session = httpRequest.getSession(true);
-            session.setAttribute("SPRING_SECURITY_CONTEXT", SecurityContextHolder.getContext());
-            session.setMaxInactiveInterval(30 * 60); // 30 דקות
+            // יצירת JWT tokens
+            String accessToken = jwtUtil.generateAccessToken(
+                    user.getUsername(),
+                    user.getId(),
+                    user.getEmail()
+            );
 
-            log.info("משתמש {} התחבר בהצלחה באמצעות Spring Security", user.getUsername());
+            String refreshToken = jwtUtil.generateRefreshToken(
+                    user.getUsername(),
+                    user.getId()
+            );
+
+            // הוספת JWT לcookie (אופציונלי)
+            Cookie jwtCookie = new Cookie("JWT_TOKEN", accessToken);
+            jwtCookie.setHttpOnly(true);
+            jwtCookie.setMaxAge(60 * 60); // 1 hour
+            jwtCookie.setPath("/");
+            response.addCookie(jwtCookie);
+
+            log.info("משתמש {} התחבר בהצלחה באמצעות JWT", user.getUsername());
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
@@ -153,9 +181,12 @@ public class AuthController {
                             "id", user.getId(),
                             "username", user.getUsername(),
                             "email", user.getEmail(),
-                            "fullName", user.getFullName(),
-                            "sessionId", session.getId()
-                    )
+                            "fullName", user.getFullName()
+                    ),
+                    "accessToken", accessToken,
+                    "refreshToken", refreshToken,
+                    "tokenType", "Bearer",
+                    "expiresIn", jwtUtil.getTokenInfo(accessToken).get("expiration")
             ));
 
         } catch (BadCredentialsException e) {
@@ -182,7 +213,85 @@ public class AuthController {
     }
 
     /**
-     * התנתקות משתמש - עדכן לשימוש ב-Spring Security
+     * רענון access token באמצעות refresh token
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<?> refreshToken(@RequestBody RefreshTokenRequest request) {
+        try {
+            String refreshToken = request.getRefreshToken();
+
+            if (refreshToken == null || refreshToken.trim().isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "Refresh token חסר"
+                ));
+            }
+
+            // בדיקת תוקף refresh token
+            if (jwtUtil.isTokenExpired(refreshToken)) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                        "success", false,
+                        "error", "Refresh token פג תוקף"
+                ));
+            }
+
+            // בדיקה שזה באמת refresh token
+            if (!jwtUtil.isRefreshToken(refreshToken)) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "Token לא תקין"
+                ));
+            }
+
+            // חילוץ פרטי המשתמש
+            String username = jwtUtil.extractUsername(refreshToken);
+            Long userId = jwtUtil.extractUserId(refreshToken);
+
+            if (username == null || userId == null) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "לא ניתן לחלץ פרטי משתמש מהtoken"
+                ));
+            }
+
+            // בדיקה שהמשתמש עדיין קיים ופעיל
+            Optional<User> userOpt = userService.findByUsername(username);
+            if (userOpt.isEmpty() || !userOpt.get().getActive()) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                        "success", false,
+                        "error", "משתמש לא קיים או לא פעיל"
+                ));
+            }
+
+            User user = userOpt.get();
+
+            // יצירת access token חדש
+            String newAccessToken = jwtUtil.generateAccessToken(
+                    user.getUsername(),
+                    user.getId(),
+                    user.getEmail()
+            );
+
+            log.info("Access token רוענן עבור משתמש: {}", username);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "Token רוענן בהצלחה",
+                    "accessToken", newAccessToken,
+                    "tokenType", "Bearer"
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה ברענון token", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה ברענון הtoken"
+            ));
+        }
+    }
+
+    /**
+     * התנתקות משתמש - עדכן לJWT (blacklist token)
      */
     @PostMapping("/logout")
     public ResponseEntity<?> logout(HttpServletRequest request, HttpServletResponse response) {
@@ -201,11 +310,15 @@ public class AuthController {
                 new SecurityContextLogoutHandler().logout(request, response, auth);
             }
 
-            // ניקוי session
-            HttpSession session = request.getSession(false);
-            if (session != null) {
-                session.invalidate();
-            }
+            // מחיקת JWT cookie
+            Cookie jwtCookie = new Cookie("JWT_TOKEN", "");
+            jwtCookie.setHttpOnly(true);
+            jwtCookie.setMaxAge(0);
+            jwtCookie.setPath("/");
+            response.addCookie(jwtCookie);
+
+            // בעתיד כאן נוסיף blacklist של הtoken
+            // TODO: Add token to blacklist/revocation list
 
             log.info("משתמש {} התנתק בהצלחה", username);
 
@@ -224,7 +337,7 @@ public class AuthController {
     }
 
     /**
-     * בדיקת סטטוס התחברות - עדכן לשימוש ב-Spring Security
+     * בדיקת סטטוס התחברות - עדכן לJWT
      */
     @GetMapping("/status")
     public ResponseEntity<?> getAuthStatus() {
@@ -254,7 +367,8 @@ public class AuthController {
                                 "email", user.getEmail(),
                                 "fullName", user.getFullName()
                         ),
-                        "authorities", auth.getAuthorities()
+                        "authorities", auth.getAuthorities(),
+                        "authType", "JWT"
                 ));
             }
 
@@ -262,7 +376,8 @@ public class AuthController {
                     "success", true,
                     "authenticated", true,
                     "username", auth.getName(),
-                    "authorities", auth.getAuthorities()
+                    "authorities", auth.getAuthorities(),
+                    "authType", "JWT"
             ));
 
         } catch (Exception e) {
@@ -330,23 +445,49 @@ public class AuthController {
         private String lastName;
 
         // Constructors
-        public RegisterRequest() {}
+        public RegisterRequest() {
+        }
 
         // Getters and setters
-        public String getUsername() { return username; }
-        public void setUsername(String username) { this.username = username; }
+        public String getUsername() {
+            return username;
+        }
 
-        public String getEmail() { return email; }
-        public void setEmail(String email) { this.email = email; }
+        public void setUsername(String username) {
+            this.username = username;
+        }
 
-        public String getPassword() { return password; }
-        public void setPassword(String password) { this.password = password; }
+        public String getEmail() {
+            return email;
+        }
 
-        public String getFirstName() { return firstName; }
-        public void setFirstName(String firstName) { this.firstName = firstName; }
+        public void setEmail(String email) {
+            this.email = email;
+        }
 
-        public String getLastName() { return lastName; }
-        public void setLastName(String lastName) { this.lastName = lastName; }
+        public String getPassword() {
+            return password;
+        }
+
+        public void setPassword(String password) {
+            this.password = password;
+        }
+
+        public String getFirstName() {
+            return firstName;
+        }
+
+        public void setFirstName(String firstName) {
+            this.firstName = firstName;
+        }
+
+        public String getLastName() {
+            return lastName;
+        }
+
+        public void setLastName(String lastName) {
+            this.lastName = lastName;
+        }
     }
 
     public static class LoginRequest {
@@ -354,13 +495,39 @@ public class AuthController {
         private String password;
 
         // Constructors
-        public LoginRequest() {}
+        public LoginRequest() {
+        }
 
         // Getters and setters
-        public String getUsername() { return username; }
-        public void setUsername(String username) { this.username = username; }
+        public String getUsername() {
+            return username;
+        }
 
-        public String getPassword() { return password; }
-        public void setPassword(String password) { this.password = password; }
+        public void setUsername(String username) {
+            this.username = username;
+        }
+
+        public String getPassword() {
+            return password;
+        }
+
+        public void setPassword(String password) {
+            this.password = password;
+        }
+    }
+
+    public static class RefreshTokenRequest {
+        private String refreshToken;
+
+        public RefreshTokenRequest() {
+        }
+
+        public String getRefreshToken() {
+            return refreshToken;
+        }
+
+        public void setRefreshToken(String refreshToken) {
+            this.refreshToken = refreshToken;
+        }
     }
 }
