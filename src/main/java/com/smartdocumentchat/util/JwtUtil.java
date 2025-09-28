@@ -13,6 +13,8 @@ import java.time.Instant;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 @RequiredArgsConstructor
@@ -20,6 +22,9 @@ import java.util.Map;
 public class JwtUtil {
 
     private final JwtProperties jwtProperties;
+
+    // רשימת refresh tokens פעילים (בסביבת production נשמור ב-Redis)
+    private final Set<String> activeRefreshTokens = ConcurrentHashMap.newKeySet();
 
     /**
      * יצירת secret key מה-string שבהגדרות
@@ -48,8 +53,118 @@ public class JwtUtil {
         Map<String, Object> claims = new HashMap<>();
         claims.put("userId", userId);
         claims.put("tokenType", "refresh");
+        claims.put("jti", generateTokenId()); // JWT ID for tracking
 
-        return createToken(claims, username, jwtProperties.getRefreshTokenExpirationMillis());
+        String refreshToken = createToken(claims, username, jwtProperties.getRefreshTokenExpirationMillis());
+
+        // הוספה לרשימת tokens פעילים
+        activeRefreshTokens.add(refreshToken);
+
+        log.debug("Generated refresh token for user: {}", username);
+        return refreshToken;
+    }
+
+    /**
+     * רענון access token באמצעות refresh token
+     */
+    public RefreshResult refreshAccessToken(String refreshToken) {
+        try {
+            // בדיקת תקינות refresh token
+            if (!isValidRefreshToken(refreshToken)) {
+                return RefreshResult.error("Refresh token is invalid or expired");
+            }
+
+            // חילוץ פרטי משתמש
+            String username = extractUsername(refreshToken);
+            Long userId = extractUserId(refreshToken);
+
+            if (username == null || userId == null) {
+                return RefreshResult.error("Invalid token data");
+            }
+
+            // יצירת access token חדש
+            String newAccessToken = generateAccessToken(username, userId, extractEmail(refreshToken));
+
+            log.info("Access token refreshed successfully for user: {}", username);
+            return RefreshResult.success(newAccessToken, refreshToken);
+
+        } catch (ExpiredJwtException e) {
+            log.debug("Refresh token expired: {}", e.getMessage());
+            return RefreshResult.error("Refresh token expired");
+        } catch (Exception e) {
+            log.error("Error refreshing access token", e);
+            return RefreshResult.error("Token refresh failed");
+        }
+    }
+
+    /**
+     * בדיקת תקינות refresh token
+     */
+    public boolean isValidRefreshToken(String refreshToken) {
+        try {
+            // בדיקה שזה refresh token
+            if (!isRefreshToken(refreshToken)) {
+                log.debug("Token is not a refresh token");
+                return false;
+            }
+
+            // בדיקת פקיעה
+            if (isTokenExpired(refreshToken)) {
+                log.debug("Refresh token is expired");
+                revokeRefreshToken(refreshToken);
+                return false;
+            }
+
+            // בדיקה ברשימת tokens פעילים
+            if (!activeRefreshTokens.contains(refreshToken)) {
+                log.debug("Refresh token not in active list");
+                return false;
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            log.debug("Refresh token validation failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * ביטול refresh token
+     */
+    public void revokeRefreshToken(String refreshToken) {
+        if (refreshToken != null) {
+            activeRefreshTokens.remove(refreshToken);
+            log.debug("Refresh token revoked");
+        }
+    }
+
+    /**
+     * ביטול כל ה-refresh tokens של משתמש
+     */
+    public void revokeAllUserRefreshTokens(String username) {
+        activeRefreshTokens.removeIf(token -> {
+            try {
+                String tokenUsername = extractUsername(token);
+                return username.equals(tokenUsername);
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        log.info("All refresh tokens revoked for user: {}", username);
+    }
+
+    /**
+     * חילוץ email מ-token
+     */
+    public String extractEmail(String token) {
+        try {
+            Claims claims = extractAllClaims(token);
+            return (String) claims.get("email");
+        } catch (Exception e) {
+            log.warn("לא ניתן לחלץ email מהtoken: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -74,6 +189,15 @@ public class JwtUtil {
             throw new RuntimeException("Failed to create JWT token", e);
         }
     }
+
+    /**
+     * יצירת מזהה ייחודי ל-token
+     */
+    private String generateTokenId() {
+        return java.util.UUID.randomUUID().toString();
+    }
+
+    // הפונקציות הקיימות נשארות כפי שהן...
 
     /**
      * חילוץ username מה-token
@@ -225,6 +349,7 @@ public class JwtUtil {
             info.put("userId", claims.get("userId"));
             info.put("email", claims.get("email"));
             info.put("tokenType", claims.get("tokenType"));
+            info.put("jti", claims.get("jti"));
             info.put("issuedAt", claims.getIssuedAt());
             info.put("expiration", claims.getExpiration());
             info.put("issuer", claims.getIssuer());
@@ -259,6 +384,52 @@ public class JwtUtil {
             return true;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * ניקוי tokens שפגו (לתחזוקה)
+     */
+    public int cleanupExpiredTokens() {
+        int removedCount = 0;
+        activeRefreshTokens.removeIf(token -> {
+            try {
+                if (isTokenExpired(token)) {
+                    return true;
+                }
+                return false;
+            } catch (Exception e) {
+                return true; // remove invalid tokens
+            }
+        });
+
+        if (removedCount > 0) {
+            log.info("Cleaned up {} expired refresh tokens", removedCount);
+        }
+
+        return removedCount;
+    }
+
+    // Inner class for refresh result
+    public static class RefreshResult {
+        public final boolean success;
+        public final String accessToken;
+        public final String refreshToken;
+        public final String error;
+
+        private RefreshResult(boolean success, String accessToken, String refreshToken, String error) {
+            this.success = success;
+            this.accessToken = accessToken;
+            this.refreshToken = refreshToken;
+            this.error = error;
+        }
+
+        public static RefreshResult success(String accessToken, String refreshToken) {
+            return new RefreshResult(true, accessToken, refreshToken, null);
+        }
+
+        public static RefreshResult error(String error) {
+            return new RefreshResult(false, null, null, error);
         }
     }
 }

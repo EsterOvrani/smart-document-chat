@@ -3,6 +3,7 @@ package com.smartdocumentchat.controller;
 import com.smartdocumentchat.entity.User;
 import com.smartdocumentchat.service.CustomUserDetailsService;
 import com.smartdocumentchat.service.UserService;
+import com.smartdocumentchat.util.AuthenticationUtils;
 import com.smartdocumentchat.util.JwtUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -32,6 +33,190 @@ public class AuthController {
     private final UserService userService;
     private final AuthenticationManager authenticationManager;
     private final JwtUtil jwtUtil;
+
+    /**
+     * רענון access token באמצעות refresh token - גרסה משופרת
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<?> refreshToken(@RequestBody RefreshTokenRequest request) {
+        try {
+            String refreshToken = request.getRefreshToken();
+
+            if (refreshToken == null || refreshToken.trim().isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "Refresh token חסר"
+                ));
+            }
+
+            // שימוש בפונקציה החדשה של JwtUtil
+            JwtUtil.RefreshResult result = jwtUtil.refreshAccessToken(refreshToken);
+
+            if (!result.success) {
+                log.warn("Refresh token validation failed: {}", result.error);
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                        "success", false,
+                        "error", result.error
+                ));
+            }
+
+            // בדיקה שהמשתמש עדיין קיים ופעיל
+            String username = jwtUtil.extractUsername(result.accessToken);
+            Optional<User> userOpt = userService.findByUsername(username);
+
+            if (userOpt.isEmpty() || !userOpt.get().getActive()) {
+                // ביטול ה-refresh token אם המשתמש לא קיים/פעיל
+                jwtUtil.revokeRefreshToken(refreshToken);
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                        "success", false,
+                        "error", "משתמש לא קיים או לא פעיל"
+                ));
+            }
+
+            User user = userOpt.get();
+
+            log.info("Access token refreshed successfully for user: {}", username);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "Token רוענן בהצלחה",
+                    "accessToken", result.accessToken,
+                    "refreshToken", result.refreshToken, // אותו refresh token
+                    "tokenType", "Bearer",
+                    "expiresIn", jwtUtil.getTokenInfo(result.accessToken).get("expiration"),
+                    "user", Map.of(
+                            "id", user.getId(),
+                            "username", user.getUsername(),
+                            "email", user.getEmail(),
+                            "fullName", user.getFullName()
+                    )
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה ברענון token", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה ברענון הtoken"
+            ));
+        }
+    }
+
+    /**
+     * ביטול refresh token
+     */
+    @PostMapping("/revoke")
+    public ResponseEntity<?> revokeRefreshToken(@RequestBody RefreshTokenRequest request) {
+        try {
+            String refreshToken = request.getRefreshToken();
+
+            if (refreshToken == null || refreshToken.trim().isEmpty()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "Refresh token חסר"
+                ));
+            }
+
+            // ביטול הtoken
+            jwtUtil.revokeRefreshToken(refreshToken);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "Refresh token בוטל בהצלחה"
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בביטול refresh token", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בביטול הtoken"
+            ));
+        }
+    }
+
+    /**
+     * ביטול כל ה-refresh tokens של המשתמש הנוכחי
+     */
+    @PostMapping("/revoke-all")
+    public ResponseEntity<?> revokeAllRefreshTokens() {
+        try {
+            Optional<User> currentUserOpt = AuthenticationUtils.getCurrentUser();
+
+            if (currentUserOpt.isEmpty()) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
+                        "success", false,
+                        "error", "משתמש לא מחובר"
+                ));
+            }
+
+            User currentUser = currentUserOpt.get();
+
+            // ביטול כל ה-refresh tokens של המשתמש
+            jwtUtil.revokeAllUserRefreshTokens(currentUser.getUsername());
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "כל ה-refresh tokens בוטלו בהצלחה"
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בביטול כל ה-refresh tokens", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בביטול הtokens"
+            ));
+        }
+    }
+
+    /**
+     * התנתקות משתמש - עדכן לביטול refresh token
+     */
+    @PostMapping("/logout")
+    public ResponseEntity<?> logout(HttpServletRequest request, HttpServletResponse response,
+                                    @RequestBody(required = false) LogoutRequest logoutRequest) {
+        try {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            String username = "unknown";
+
+            if (auth != null && auth.getPrincipal() instanceof CustomUserDetailsService.CustomUserPrincipal) {
+                CustomUserDetailsService.CustomUserPrincipal userPrincipal =
+                        (CustomUserDetailsService.CustomUserPrincipal) auth.getPrincipal();
+                username = userPrincipal.getUsername();
+            }
+
+            // ביטול refresh token אם סופק
+            if (logoutRequest != null && logoutRequest.getRefreshToken() != null) {
+                jwtUtil.revokeRefreshToken(logoutRequest.getRefreshToken());
+                log.debug("Refresh token revoked during logout for user: {}", username);
+            }
+
+            // ביצוע logout באמצעות Spring Security
+            if (auth != null) {
+                new SecurityContextLogoutHandler().logout(request, response, auth);
+            }
+
+            // מחיקת JWT cookie
+            Cookie jwtCookie = new Cookie("JWT_TOKEN", "");
+            jwtCookie.setHttpOnly(true);
+            jwtCookie.setMaxAge(0);
+            jwtCookie.setPath("/");
+            response.addCookie(jwtCookie);
+
+            log.info("משתמש {} התנתק בהצלחה", username);
+
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "התנתקות בוצעה בהצלחה"
+            ));
+
+        } catch (Exception e) {
+            log.error("שגיאה בהתנתקות", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "success", false,
+                    "error", "שגיאה בהתנתקות"
+            ));
+        }
+    }
+
 
     /**
      * רישום משתמש חדש - עדכן לJWT
@@ -212,129 +397,6 @@ public class AuthController {
         }
     }
 
-    /**
-     * רענון access token באמצעות refresh token
-     */
-    @PostMapping("/refresh")
-    public ResponseEntity<?> refreshToken(@RequestBody RefreshTokenRequest request) {
-        try {
-            String refreshToken = request.getRefreshToken();
-
-            if (refreshToken == null || refreshToken.trim().isEmpty()) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "Refresh token חסר"
-                ));
-            }
-
-            // בדיקת תוקף refresh token
-            if (jwtUtil.isTokenExpired(refreshToken)) {
-                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
-                        "success", false,
-                        "error", "Refresh token פג תוקף"
-                ));
-            }
-
-            // בדיקה שזה באמת refresh token
-            if (!jwtUtil.isRefreshToken(refreshToken)) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "Token לא תקין"
-                ));
-            }
-
-            // חילוץ פרטי המשתמש
-            String username = jwtUtil.extractUsername(refreshToken);
-            Long userId = jwtUtil.extractUserId(refreshToken);
-
-            if (username == null || userId == null) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "לא ניתן לחלץ פרטי משתמש מהtoken"
-                ));
-            }
-
-            // בדיקה שהמשתמש עדיין קיים ופעיל
-            Optional<User> userOpt = userService.findByUsername(username);
-            if (userOpt.isEmpty() || !userOpt.get().getActive()) {
-                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of(
-                        "success", false,
-                        "error", "משתמש לא קיים או לא פעיל"
-                ));
-            }
-
-            User user = userOpt.get();
-
-            // יצירת access token חדש
-            String newAccessToken = jwtUtil.generateAccessToken(
-                    user.getUsername(),
-                    user.getId(),
-                    user.getEmail()
-            );
-
-            log.info("Access token רוענן עבור משתמש: {}", username);
-
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "message", "Token רוענן בהצלחה",
-                    "accessToken", newAccessToken,
-                    "tokenType", "Bearer"
-            ));
-
-        } catch (Exception e) {
-            log.error("שגיאה ברענון token", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "error", "שגיאה ברענון הtoken"
-            ));
-        }
-    }
-
-    /**
-     * התנתקות משתמש - עדכן לJWT (blacklist token)
-     */
-    @PostMapping("/logout")
-    public ResponseEntity<?> logout(HttpServletRequest request, HttpServletResponse response) {
-        try {
-            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-            String username = "unknown";
-
-            if (auth != null && auth.getPrincipal() instanceof CustomUserDetailsService.CustomUserPrincipal) {
-                CustomUserDetailsService.CustomUserPrincipal userPrincipal =
-                        (CustomUserDetailsService.CustomUserPrincipal) auth.getPrincipal();
-                username = userPrincipal.getUsername();
-            }
-
-            // ביצוע logout באמצעות Spring Security
-            if (auth != null) {
-                new SecurityContextLogoutHandler().logout(request, response, auth);
-            }
-
-            // מחיקת JWT cookie
-            Cookie jwtCookie = new Cookie("JWT_TOKEN", "");
-            jwtCookie.setHttpOnly(true);
-            jwtCookie.setMaxAge(0);
-            jwtCookie.setPath("/");
-            response.addCookie(jwtCookie);
-
-            // בעתיד כאן נוסיף blacklist של הtoken
-            // TODO: Add token to blacklist/revocation list
-
-            log.info("משתמש {} התנתק בהצלחה", username);
-
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "message", "התנתקות בוצעה בהצלחה"
-            ));
-
-        } catch (Exception e) {
-            log.error("שגיאה בהתנתקות", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
-                    "success", false,
-                    "error", "שגיאה בהתנתקות"
-            ));
-        }
-    }
 
     /**
      * בדיקת סטטוס התחברות - עדכן לJWT
@@ -529,5 +591,14 @@ public class AuthController {
         public void setRefreshToken(String refreshToken) {
             this.refreshToken = refreshToken;
         }
+    }
+
+    public static class LogoutRequest {
+        private String refreshToken;
+
+        public LogoutRequest() {}
+
+        public String getRefreshToken() { return refreshToken; }
+        public void setRefreshToken(String refreshToken) { this.refreshToken = refreshToken; }
     }
 }

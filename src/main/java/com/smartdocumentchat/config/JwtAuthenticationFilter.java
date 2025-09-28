@@ -26,6 +26,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private final JwtUtil jwtUtil;
     private final CustomUserDetailsService userDetailsService;
+    private static final String REFRESH_TOKEN_HEADER = "X-Refresh-Token";
+
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
@@ -63,8 +65,16 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             // בדיקת תוקף הtoken
             if (jwtUtil.isTokenExpired(jwt)) {
                 log.debug("JWT token is expired for user: {}", username);
-                filterChain.doFilter(request, response);
-                return;
+
+                // ניסיון רענון אוטומטי אם יש refresh token
+                String refreshToken = extractRefreshTokenFromRequest(request);
+                if (refreshToken != null && attemptTokenRefresh(refreshToken, response)) {
+                    log.debug("Token refreshed automatically for user: {}", username);
+                    // נמשיך עם הtoken החדש שנשמר ב-response headers
+                } else {
+                    filterChain.doFilter(request, response);
+                    return;
+                }
             }
 
             // בדיקה שזה לא refresh token (access tokens בלבד)
@@ -113,6 +123,52 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
         filterChain.doFilter(request, response);
     }
+
+    /**
+     * חילוץ refresh token מהrequest
+     */
+    private String extractRefreshTokenFromRequest(HttpServletRequest request) {
+        // נחפש בheader מיוחד
+        String refreshToken = request.getHeader(REFRESH_TOKEN_HEADER);
+        if (refreshToken != null) {
+            return refreshToken;
+        }
+
+        // נחפש גם בcookie
+        if (request.getCookies() != null) {
+            for (var cookie : request.getCookies()) {
+                if ("REFRESH_TOKEN".equals(cookie.getName())) {
+                    return cookie.getValue();
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * ניסיון רענון אוטומטי של token
+     */
+    private boolean attemptTokenRefresh(String refreshToken, HttpServletResponse response) {
+        try {
+            JwtUtil.RefreshResult result = jwtUtil.refreshAccessToken(refreshToken);
+
+            if (result.success) {
+                // הוספת הtoken החדש ל-response headers
+                response.setHeader("X-New-Access-Token", result.accessToken);
+                response.setHeader("X-Token-Refreshed", "true");
+
+                log.debug("Token refreshed automatically");
+                return true;
+            }
+
+        } catch (Exception e) {
+            log.debug("Automatic token refresh failed: {}", e.getMessage());
+        }
+
+        return false;
+    }
+
 
     /**
      * חילוץ JWT token מה-Authorization header
