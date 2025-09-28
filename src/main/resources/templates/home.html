@@ -223,7 +223,7 @@
     <div class="logo">📚 Smart Document Chat</div>
     <div class="user-info">
         <span class="welcome-text" sec:authentication="name">שלום, משתמש</span>
-        <a href="/api/auth/logout" class="logout-btn" onclick="return confirmLogout()">התנתק</a>
+        <a href="#" class="logout-btn" onclick="logout(event)">התנתק</a>
     </div>
 </header>
 
@@ -272,6 +272,32 @@
 </div>
 
 <script>
+        function logout(event) {
+            event.preventDefault(); // מונע מהקישור לנווט
+
+            if (confirm('האם אתה בטוח שברצונך להתנתק?')) {
+                fetch('/api/auth/logout', {
+                    method: 'POST',   // או GET, תלוי איך הגדרת ב-Spring Security
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                })
+                .then(response => {
+                    if (response.ok) {
+                        // אחרי התנתקות – נווט למסך התחברות
+                        window.location.href = '/login';
+                    } else {
+                        console.error('Logout failed:', response.status);
+                        alert('אירעה שגיאה בהתנתקות');
+                    }
+                })
+                .catch(error => {
+                    console.error('Logout error:', error);
+                    alert('שגיאה בחיבור לשרת');
+                });
+            }
+        }
+
         function confirmLogout() {
             return confirm('האם אתה בטוח שברצונך להתנתק?');
         }
@@ -303,6 +329,8 @@
             .catch(error => {
                 console.error('Error checking auth status:', error);
             });
+
+
     </script>
 </body>
 </html>
