@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>רישום - Smart Document Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            direction: rtl;
+        }
+
+        .register-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            padding: 40px;
+            width: 100%;
+            max-width: 450px;
+            text-align: center;
+        }
+
+        .logo {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1rem;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+            text-align: right;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+
+        input[type="text"],
+        input[type="email"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e1e8ed;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+            direction: ltr;
+            text-align: left;
+        }
+
+        input[type="text"]:focus,
+        input[type="email"]:focus,
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .form-row {
+            display: flex;
+            gap: 15px;
+        }
+
+        .form-row .form-group {
+            flex: 1;
+        }
+
+        .register-btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+
+        .register-btn:hover {
+            transform: translateY(-2px);
+        }
+
+        .register-btn:active {
+            transform: translateY(0);
+        }
+
+        .register-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .alert-error {
+            background-color: #fee;
+            color: #c33;
+            border: 1px solid #fcc;
+        }
+
+        .alert-success {
+            background-color: #efe;
+            color: #363;
+            border: 1px solid #cfc;
+        }
+
+        .alert-warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+
+        .login-link {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #e1e8ed;
+        }
+
+        .login-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .login-link a:hover {
+            text-decoration: underline;
+        }
+
+        .loading {
+            display: none;
+            margin-top: 10px;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .password-strength {
+            margin-top: 5px;
+            font-size: 12px;
+            text-align: left;
+        }
+
+        .strength-weak { color: #dc3545; }
+        .strength-medium { color: #ffc107; }
+        .strength-strong { color: #28a745; }
+
+        .field-validation {
+            font-size: 12px;
+            margin-top: 5px;
+            text-align: left;
+        }
+
+        .validation-error { color: #dc3545; }
+        .validation-success { color: #28a745; }
+
+        @media (max-width: 480px) {
+            .register-container {
+                margin: 20px;
+                padding: 30px 25px;
+            }
+
+            .logo {
+                font-size: 2rem;
+            }
+
+            .form-row {
+                flex-direction: column;
+                gap: 0;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="register-container">
+    <div class="logo">📚 Smart Chat</div>
+    <div class="subtitle">הצטרף למערכת ניהול המסמכים החכמה</div>
+
+    <!-- Alert Area -->
+    <div id="alertArea"></div>
+
+    <form id="registerForm">
+        <div class="form-row">
+            <div class="form-group">
+                <label for="firstName">שם פרטי:</label>
+                <input type="text" id="firstName" name="firstName" required>
+                <div id="firstNameValidation" class="field-validation"></div>
+            </div>
+
+            <div class="form-group">
+                <label for="lastName">שם משפחה:</label>
+                <input type="text" id="lastName" name="lastName" required>
+                <div id="lastNameValidation" class="field-validation"></div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="username">שם משתמש:</label>
+            <input type="text" id="username" name="username" required>
+            <div id="usernameValidation" class="field-validation"></div>
+        </div>
+
+        <div class="form-group">
+            <label for="email">כתובת אימייל:</label>
+            <input type="email" id="email" name="email" required>
+            <div id="emailValidation" class="field-validation"></div>
+        </div>
+
+        <div class="form-group">
+            <label for="password">סיסמה:</label>
+            <input type="password" id="password" name="password" required>
+            <div id="passwordStrength" class="password-strength"></div>
+            <div id="passwordValidation" class="field-validation"></div>
+        </div>
+
+        <div class="form-group">
+            <label for="confirmPassword">אישור סיסמה:</label>
+            <input type="password" id="confirmPassword" name="confirmPassword" required>
+            <div id="confirmPasswordValidation" class="field-validation"></div>
+        </div>
+
+        <button type="submit" class="register-btn" id="submitBtn">הירשם</button>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>מעבד רישום...</p>
+        </div>
+    </form>
+
+    <div class="login-link">
+        <p>כבר יש לך חשבון? <a href="/login">התחבר כאן</a></p>
+    </div>
+</div>
+
+<script>
+    // Validation functions
+    function validateUsername(username) {
+        const usernameRegex = /^[a-zA-Z0-9_]{3,20}$/;
+        if (!username) return { valid: false, message: 'שם משתמש הוא שדה חובה' };
+        if (!usernameRegex.test(username)) {
+            return { valid: false, message: '3-20 תווים: אותיות אנגליות, מספרים ו-_ בלבד' };
+        }
+        return { valid: true, message: '' };
+    }
+
+    function validateEmail(email) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!email) return { valid: false, message: 'אימייל הוא שדה חובה' };
+        if (!emailRegex.test(email)) {
+            return { valid: false, message: 'פורמט אימייל לא תקין' };
+        }
+        return { valid: true, message: '' };
+    }
+
+    function validatePassword(password) {
+        if (!password) return { valid: false, message: 'סיסמה היא שדה חובה', strength: 'weak' };
+        if (password.length < 6) {
+            return { valid: false, message: 'סיסמה חייבת להכיל לפחות 6 תווים', strength: 'weak' };
+        }
+
+        let strength = 'weak';
+        let strengthText = 'חלשה';
+
+        if (password.length >= 8 && /[A-Z]/.test(password) && /[0-9]/.test(password)) {
+            strength = 'strong';
+            strengthText = 'חזקה';
+        } else if (password.length >= 6 && (/[A-Z]/.test(password) || /[0-9]/.test(password))) {
+            strength = 'medium';
+            strengthText = 'בינונית';
+        }
+
+        return { valid: true, message: '', strength: strength, strengthText: strengthText };
+    }
+
+    function validateName(name, fieldName) {
+        if (!name || name.trim().length === 0) {
+            return { valid: false, message: `${fieldName} הוא שדה חובה` };
+        }
+        if (name.trim().length < 2) {
+            return { valid: false, message: `${fieldName} חייב להכיל לפחות 2 תווים` };
+        }
+        return { valid: true, message: '' };
+    }
+
+    function showValidation(elementId, validation) {
+        const element = document.getElementById(elementId);
+        element.textContent = validation.message;
+        element.className = `field-validation ${validation.valid ? 'validation-success' : 'validation-error'}`;
+    }
+
+    function showPasswordStrength(validation) {
+        const element = document.getElementById('passwordStrength');
+        if (validation.strengthText) {
+            element.textContent = `חוזק סיסמה: ${validation.strengthText}`;
+            element.className = `password-strength strength-${validation.strength}`;
+        } else {
+            element.textContent = '';
+        }
+    }
+
+    // Real-time validation
+    document.getElementById('username').addEventListener('input', function() {
+        const validation = validateUsername(this.value);
+        showValidation('usernameValidation', validation);
+
+        // Check availability if valid format
+        if (validation.valid && this.value.length >= 3) {
+            checkUsernameAvailability(this.value);
+        }
+    });
+
+    document.getElementById('email').addEventListener('input', function() {
+        const validation = validateEmail(this.value);
+        showValidation('emailValidation', validation);
+
+        // Check availability if valid format
+        if (validation.valid) {
+            checkEmailAvailability(this.value);
+        }
+    });
+
+    document.getElementById('password').addEventListener('input', function() {
+        const validation = validatePassword(this.value);
+        showValidation('passwordValidation', validation);
+        showPasswordStrength(validation);
+
+        // Re-validate confirm password if it has a value
+        const confirmPassword = document.getElementById('confirmPassword').value;
+        if (confirmPassword) {
+            validateConfirmPassword();
+        }
+    });
+
+    document.getElementById('confirmPassword').addEventListener('input', validateConfirmPassword);
+
+    document.getElementById('firstName').addEventListener('input', function() {
+        const validation = validateName(this.value, 'שם פרטי');
+        showValidation('firstNameValidation', validation);
+    });
+
+    document.getElementById('lastName').addEventListener('input', function() {
+        const validation = validateName(this.value, 'שם משפחה');
+        showValidation('lastNameValidation', validation);
+    });
+
+    function validateConfirmPassword() {
+        const password = document.getElementById('password').value;
+        const confirmPassword = document.getElementById('confirmPassword').value;
+
+        if (!confirmPassword) {
+            showValidation('confirmPasswordValidation', { valid: false, message: 'אישור סיסמה הוא שדה חובה' });
+            return false;
+        }
+
+        if (password !== confirmPassword) {
+            showValidation('confirmPasswordValidation', { valid: false, message: 'הסיסמאות אינן זהות' });
+            return false;
+        }
+
+        showValidation('confirmPasswordValidation', { valid: true, message: 'הסיסמאות זהות' });
+        return true;
+    }
+
+    // Check username availability
+    function checkUsernameAvailability(username) {
+        fetch(`/api/auth/check-username/${encodeURIComponent(username)}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    if (data.available) {
+                        showValidation('usernameValidation', { valid: true, message: 'שם המשתמש זמין ✓' });
+                    } else {
+                        showValidation('usernameValidation', { valid: false, message: 'שם המשתמש כבר תפוס' });
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error checking username:', error);
+            });
+    }
+
+    // Check email availability
+    function checkEmailAvailability(email) {
+        fetch(`/api/auth/check-email/${encodeURIComponent(email)}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    if (data.available) {
+                        showValidation('emailValidation', { valid: true, message: 'האימייל זמין ✓' });
+                    } else {
+                        showValidation('emailValidation', { valid: false, message: 'האימייל כבר בשימוש' });
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error checking email:', error);
+            });
+    }
+
+    // Show alert
+    function showAlert(message, type = 'error') {
+        const alertArea = document.getElementById('alertArea');
+        alertArea.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+
+        // Auto-hide success messages after 5 seconds
+        if (type === 'success') {
+            setTimeout(() => {
+                alertArea.innerHTML = '';
+            }, 5000);
+        }
+    }
+
+    // Form validation
+    function validateForm() {
+        const firstName = document.getElementById('firstName').value;
+        const lastName = document.getElementById('lastName').value;
+        const username = document.getElementById('username').value;
+        const email = document.getElementById('email').value;
+        const password = document.getElementById('password').value;
+        const confirmPassword = document.getElementById('confirmPassword').value;
+
+        // Validate all fields
+        const validations = [
+            validateName(firstName, 'שם פרטי'),
+            validateName(lastName, 'שם משפחה'),
+            validateUsername(username),
+            validateEmail(email),
+            validatePassword(password)
+        ];
+
+        // Check confirm password
+        if (password !== confirmPassword) {
+            validations.push({ valid: false, message: 'הסיסמאות אינן זהות' });
+        }
+
+        const hasErrors = validations.some(v => !v.valid);
+        if (hasErrors) {
+            const errorMessages = validations.filter(v => !v.valid).map(v => v.message);
+            showAlert('נא לתקן את השגיאות הבאות:<br>' + errorMessages.join('<br>'));
+            return false;
+        }
+
+        return true;
+    }
+
+    // Form submission
+    document.getElementById('registerForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+
+        if (!validateForm()) {
+            return;
+        }
+
+        const formData = {
+            username: document.getElementById('username').value.trim(),
+            email: document.getElementById('email').value.trim(),
+            firstName: document.getElementById('firstName').value.trim(),
+            lastName: document.getElementById('lastName').value.trim(),
+            password: document.getElementById('password').value
+        };
+
+        const loading = document.getElementById('loading');
+        const submitBtn = document.getElementById('submitBtn');
+
+        // Show loading
+        submitBtn.style.display = 'none';
+        loading.style.display = 'block';
+
+        // Send register request
+        fetch('/api/auth/register', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(formData)
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                showAlert('רישום בוצע בהצלחה! מעביר לדף ההתחברות...', 'success');
+
+                // Redirect to login page after 2 seconds
+                setTimeout(() => {
+                    window.location.href = '/login?msg=' + encodeURIComponent('רישום בוצע בהצלחה! אנא התחבר');
+                }, 2000);
+            } else {
+                showAlert(data.error || 'שגיאה ברישום המשתמש');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            showAlert('שגיאה בחיבור לשרת');
+        })
+        .finally(() => {
+            // Hide loading
+            submitBtn.style.display = 'block';
+            loading.style.display = 'none';
+        });
+    });
+</script>
+</body>
+</html>

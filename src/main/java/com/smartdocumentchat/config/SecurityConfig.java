@@ -52,59 +52,19 @@ public class SecurityConfig {
         log.info("Configuring security filter chain with JWT authentication");
 
         http
-                // Disable CSRF for JWT (stateless)
                 .csrf(csrf -> csrf.disable())
-
-                // Set session management to stateless (no sessions with JWT)
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-
-                // Configure authorization rules
                 .authorizeHttpRequests(authz -> authz
-                        // Authentication endpoints - always allow
                         .requestMatchers("/api/auth/**").permitAll()
                         .requestMatchers("/api/status").permitAll()
                         .requestMatchers("/actuator/**").permitAll()
-
-                        // Static resources and login page - allow
-                        .requestMatchers("/login", "/error", "/css/**", "/js/**", "/images/**").permitAll()
-
-                        // All other requests require authentication
+                        .requestMatchers( "/register", "/login", "/error", "/css/**", "/js/**", "/images/**").permitAll()
                         .anyRequest().authenticated()
                 )
+                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
 
-                // Add JWT filter before UsernamePasswordAuthenticationFilter
-                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
-
-                // Form login configuration (for web interface)
-                .formLogin(form -> form
-                        .loginPage("/login")
-                        .loginProcessingUrl("/api/auth/login")
-                        .usernameParameter("username")
-                        .passwordParameter("password")
-                        .successHandler(authenticationSuccessHandler())
-                        .failureHandler(authenticationFailureHandler())
-                        .permitAll()
-                )
-
-                // Logout configuration
-                .logout(logout -> logout
-                        .logoutUrl("/api/auth/logout")
-                        .logoutSuccessHandler(logoutSuccessHandler())
-                        .invalidateHttpSession(true)
-                        .clearAuthentication(true)
-                        .deleteCookies("JSESSIONID", "JWT_TOKEN")
-                        .permitAll()
-                )
-
-                // Security headers
-                .headers(headers -> headers
-                        .frameOptions(frame -> frame.sameOrigin())
-                        .contentTypeOptions(Customizer.withDefaults())
-                        .referrerPolicy(referrer ->
-                                referrer.policy(org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
-                );
-
+        // הסר לגמרי את ה-formLogin ו-logout sections
 
         log.info("Security filter chain configured successfully with JWT authentication");
         return http.build();
