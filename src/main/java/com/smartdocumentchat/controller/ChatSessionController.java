@@ -10,6 +10,7 @@ import com.smartdocumentchat.service.ChatSessionService;
 import com.smartdocumentchat.service.UserService;
 import com.smartdocumentchat.service.CacheService;
 import com.smartdocumentchat.service.QuestionHashService;
+import com.smartdocumentchat.util.AuthenticationUtils;
 import dev.langchain4j.chain.ConversationalRetrievalChain;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -17,6 +18,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -25,6 +27,7 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@PreAuthorize("isAuthenticated()")
 @RestController
 @RequestMapping("/api/sessions")
 @RequiredArgsConstructor
@@ -41,15 +44,43 @@ public class ChatSessionController {
     private final QdrantConfig.SessionAwareIngestorFactory ingestorFactory;
 
     /**
-     * קבלת פרטי השיחה הפעילה (פאנל ימין)
+     * קבלת פרטי השיחה הפעילה (פאנל ימין) - עם אבטחה מחוזקת
      */
     @GetMapping("/{sessionId}")
+    @PreAuthorize("isAuthenticated()") // הרשאה ברמת המתודה
     public ResponseEntity<?> getActiveSessionDetails(
             @PathVariable Long sessionId,
             @RequestParam(value = "userId", required = false) Long userId,
             @RequestParam(value = "includeDocuments", defaultValue = "true") boolean includeDocuments) {
         try {
+            // שלב 1: בדיקת תקינות פרמטרים
+            if (sessionId == null || sessionId <= 0) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "מזהה שיחה לא תקין"
+                ));
+            }
+
+            // שלב 2: בדיקת הרשאות משתמש
+            validateUserAccess(userId);
+
+            // שלב 3: קבלת המשתמש הנוכחי
             User currentUser = getCurrentUser(userId);
+
+            // שלב 4: בדיקת הרשאה נוספת - אם צוין userId שונה מהמשתמש הנוכחי
+            if (userId != null && !AuthenticationUtils.isCurrentUser(userId)) {
+                // רק admin יכול לגשת לשיחות של משתמשים אחרים
+                if (!AuthenticationUtils.hasAdminRole()) {
+                    log.warn("משתמש {} ניסה לגשת לשיחה {} של משתמש {} ללא הרשאה",
+                            AuthenticationUtils.getCurrentUserId().orElse(-1L), sessionId, userId);
+                    return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                            "success", false,
+                            "error", "אין הרשאה לצפות בשיחות של משתמשים אחרים"
+                    ));
+                }
+            }
+
+            // שלב 5: קבלת השיחה מהמסד נתונים
             Optional<ChatSession> sessionOpt = chatSessionService.findById(sessionId);
 
             if (sessionOpt.isEmpty()) {
@@ -61,41 +92,133 @@ public class ChatSessionController {
 
             ChatSession session = sessionOpt.get();
 
-            // בדיקת הרשאות
+            // שלב 6: בדיקת הרשאות מפורטת לשיחה הספציפית
             if (!isUserAuthorizedForSession(currentUser, session)) {
+                log.warn("משתמש {} ניסה לגשת לשיחה {} ללא הרשאה",
+                        currentUser.getId(), sessionId);
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
                         "success", false,
                         "error", "אין הרשאה לשיחה זו"
                 ));
             }
 
+            // שלב 7: בדיקת סטטוס השיחה
+            if (!session.getActive()) {
+                return ResponseEntity.badRequest().body(Map.of(
+                        "success", false,
+                        "error", "שיחה לא פעילה"
+                ));
+            }
+
+            // שלב 8: בניית מידע השיחה
             Map<String, Object> sessionDetails = buildSessionResponse(session, currentUser);
 
-            // הוספת מסמכים אם נדרש
+            // שלב 9: הוספת מסמכים אם נדרש (עם בדיקת הרשאות)
             if (includeDocuments) {
-                List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
-                sessionDetails.put("documents", documents.stream()
-                        .map(this::buildDocumentSummary)
-                        .toList());
+                try {
+                    List<Document> documents = pdfProcessingService.getDocumentsBySession(session);
+
+                    // סינון מסמכים לפי הרשאות משתמש
+                    List<Document> authorizedDocuments = documents.stream()
+                            .filter(doc -> isUserAuthorizedForDocument(currentUser, doc))
+                            .collect(Collectors.toList());
+
+                    sessionDetails.put("documents", authorizedDocuments.stream()
+                            .map(this::buildDocumentSummary)
+                            .collect(Collectors.toList()));
+
+                    sessionDetails.put("documentsCount", authorizedDocuments.size());
+
+                } catch (Exception e) {
+                    log.error("שגיאה בקבלת מסמכי השיחה: {}", sessionId, e);
+                    // לא נכשיל את כל הבקשה בגלל שגיאה במסמכים
+                    sessionDetails.put("documents", List.of());
+                    sessionDetails.put("documentsError", "שגיאה בטעינת המסמכים");
+                }
             }
+
+            // שלב 10: עדכון זמן גישה אחרונה (רק למשתמש הבעלים)
+            if (session.getUser().getId().equals(currentUser.getId())) {
+                try {
+                    chatSessionService.updateLastActivity(sessionId);
+                } catch (Exception e) {
+                    log.warn("לא ניתן לעדכן זמן פעילות לשיחה: {}", sessionId, e);
+                    // לא נכשיל את הבקשה בגלל זה
+                }
+            }
+
+            // שלב 11: רישום פעילות לצורכי ביקורת
+            log.info("משתמש {} צפה בשיחה {} (כולל מסמכים: {})",
+                    currentUser.getUsername(), sessionId, includeDocuments);
 
             return ResponseEntity.ok(Map.of(
                     "success", true,
-                    "session", sessionDetails
+                    "session", sessionDetails,
+                    "accessTime", LocalDateTime.now().format(
+                            java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")),
+                    "userRole", AuthenticationUtils.hasAdminRole() ? "admin" : "user"
             ));
 
         } catch (SecurityException e) {
+            log.warn("הפרת אבטחה בניסיון גישה לשיחה {}: {}", sessionId, e.getMessage());
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
                     "success", false,
                     "error", e.getMessage()
             ));
+        } catch (IllegalArgumentException e) {
+            log.warn("פרמטרים לא תקינים בבקשה לשיחה {}: {}", sessionId, e.getMessage());
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "error", e.getMessage()
+            ));
         } catch (Exception e) {
-            log.error("שגיאה בקבלת פרטי שיחה: {}", sessionId, e);
+            log.error("שגיאה כללית בקבלת פרטי שיחה: {}", sessionId, e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
                     "success", false,
-                    "error", "שגיאה בקבלת פרטי השיחה"
+                    "error", "שגיאה פנימית בשרת"
             ));
         }
+    }
+
+    /**
+     * בדיקת הרשאות למשאב משתמש - מתודה חדשה
+     */
+    private void validateUserAccess(Long userId) {
+        if (userId != null && !AuthenticationUtils.canAccessUserResource(userId)) {
+            throw new SecurityException("אין הרשאה למשאב זה");
+        }
+    }
+
+    /**
+     * בדיקת הרשאות למסמך ספציפי - מתודה חדשה
+     */
+    private boolean isUserAuthorizedForDocument(User user, Document document) {
+        // המשתמש יכול לראות רק את המסמכים שלו, או admin יכול לראות הכל
+        return document.getUser().getId().equals(user.getId()) ||
+                AuthenticationUtils.hasAdminRole();
+    }
+
+    /**
+     * בדיקת הרשאות לשיחה - מתודה מעודכנת
+     */
+    private boolean isUserAuthorizedForSession(User user, ChatSession session) {
+        // בדיקות בסיסיות
+        if (session == null || user == null || !user.getActive() || !session.getActive()) {
+            return false;
+        }
+
+        // הבעלים של השיחה תמיד מורשה
+        if (session.getUser().getId().equals(user.getId())) {
+            return true;
+        }
+
+        // admin יכול לגשת לכל השיחות
+        if (AuthenticationUtils.hasAdminRole()) {
+            return true;
+        }
+
+        // אחרת - אין הרשאה
+        return false;
     }
 
     /**
@@ -682,11 +805,6 @@ public class ChatSessionController {
         return userService.getOrCreateDemoUser();
     }
 
-    private boolean isUserAuthorizedForSession(User user, ChatSession session) {
-        return session.getUser().getId().equals(user.getId()) &&
-                session.getActive() &&
-                user.getActive();
-    }
 
     private Map<String, Object> buildSessionResponse(ChatSession session, User user) {
         Map<String, Object> response = new java.util.HashMap<>();

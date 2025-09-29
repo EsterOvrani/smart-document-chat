@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 import java.util.Optional;
 
+@PreAuthorize("hasRole('ADMIN') or @authenticationUtils.isCurrentUser(#userId)")
 @RestController
 @RequestMapping("/api/users")
 @RequiredArgsConstructor
@@ -20,6 +21,7 @@ import java.util.Optional;
 public class UserController {
 
     private final UserService userService;
+
 
     /**
      * רישום משתמש חדש - מועבר ל-AuthController
@@ -39,7 +41,7 @@ public class UserController {
      * קבלת פרטי משתמש לפי ID - עם בדיקת הרשאות
      */
     @GetMapping("/{userId}")
-    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId) or hasRole('ADMIN')")
+    @PreAuthorize("@authenticationUtils.canAccessUserResource(#userId)")
     public ResponseEntity<?> getUserById(@PathVariable Long userId) {
         try {
             // Additional security check
@@ -93,10 +95,8 @@ public class UserController {
      * עדכון פרטי משתמש - עם בדיקת הרשאות
      */
     @PutMapping("/{userId}")
-    @PreAuthorize("@authenticationUtils.isCurrentUser(#userId)")
-    public ResponseEntity<?> updateUser(
-            @PathVariable Long userId,
-            @RequestBody UserUpdateRequest request) {
+    @PreAuthorize("@authenticationUtils.canAccessUserResource(#userId)")
+    public ResponseEntity<?> updateUser(@PathVariable Long userId, @RequestBody UserUpdateRequest request) {
         try {
             // Additional security check
             if (!AuthenticationUtils.isCurrentUser(userId)) {
