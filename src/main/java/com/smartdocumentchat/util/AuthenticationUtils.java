@@ -85,18 +85,6 @@ public class AuthenticationUtils {
                 .orElse(false);
     }
 
-    /**
-     * בדיקה אם המשתמש הנוכחי הוא בעל שם המשתמש הנתון
-     */
-    public static boolean isCurrentUser(String username) {
-        if (username == null || username.trim().isEmpty()) {
-            return false;
-        }
-
-        return getCurrentUsername()
-                .map(currentUsername -> currentUsername.equalsIgnoreCase(username.trim()))
-                .orElse(false);
-    }
 
     /**
      * בדיקה אם המשתמש הנוכחי זהה למשתמש הנתון
@@ -219,6 +207,45 @@ public class AuthenticationUtils {
         } catch (Exception e) {
             log.error("שגיאה בקבלת תפקידי משתמש", e);
             return java.util.Collections.emptyList();
+        }
+    }
+
+    /**
+     * בדיקת הרשאת admin למשתמש הנוכחי
+     */
+    public static boolean hasAdminRole() {
+        try {
+            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+            if (authentication == null || !authentication.isAuthenticated()) {
+                return false;
+            }
+
+            return authentication.getAuthorities().stream()
+                    .anyMatch(authority -> "ROLE_ADMIN".equals(authority.getAuthority()));
+
+        } catch (Exception e) {
+            log.error("שגיאה בבדיקת הרשאות admin", e);
+            return false;
+        }
+    }
+
+    /**
+     * בדיקה אם המשתמש הנוכחי יכול לגשת למשאב של משתמש אחר
+     */
+    public static boolean canAccessUserResource(Long userId) {
+        return hasAdminRole() || isCurrentUser(userId);
+    }
+
+    /**
+     * בדיקת הרשאה לפי Path Variable
+     */
+    public boolean isCurrentUser(String userIdStr) {
+        try {
+            Long userId = Long.parseLong(userIdStr);
+            return isCurrentUser(userId);
+        } catch (NumberFormatException e) {
+            return false;
         }
     }
 }
